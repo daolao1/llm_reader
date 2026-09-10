@@ -255,3 +255,74 @@ prepare   ── 从 tag/输入解析 versionName + versionCode(=major*10000+min
 >
 > 注意 2：私有仓库的 Actions 分钟数是**计费**的（公开仓库免费），且 macOS runner
 > 按 10 倍计费。额度紧张时可以把 `macos-latest` 从矩阵里去掉。
+
+---
+
+## 8. CI 踩坑记录（Windows 打包）
+
+`v1.0.0` 到 `v1.0.1` 之间连续踩了三个坑，都只在 Windows runner 上出现，
+且报错信息都不指向真正的原因，记在这里避免重蹈。
+
+### 8.1 PowerShell 把 `-PversionName=1.0.0` 拆断了
+
+Windows runner 的 `run:` 默认执行 shell 是 PowerShell，它会把
+
+```
+-PversionName=1.0.0
+```
+
+在**第一个点**处拆成 `-PversionName=1` 和 `.0.0`，后者被 Gradle 当成任务名：
+
+```
+Task '.0.0' not found in root project 'llm_reader'
+```
+
+**修法**：桌面端三个平台统一 `shell: bash` + `./gradlew`
+（`windows-latest` 自带 Git Bash），参数加引号。这样参数解析语义三端一致。
+见 `.github/workflows/release.yml` 的 `Package ... installer` 步骤。
+
+### 8.2 jpackage 做 MSI 需要 WiX，而且只要 v3
+
+jpackage 生成 `.msi` 依赖 WiX 的 `candle.exe` / `light.exe`。
+注意 JDK 17 的 jpackage **只支持 WiX v3**（对 v4/v5 的支持是
+[JDK-8319457](https://bugs.openjdk.org/browse/JDK-8319457) 才加的），
+所以不能只判断 `candle.exe` 在不在 —— runner 上可能装的是 v4/v5，照样失败。
+
+**修法**：认准 `C:\Program Files (x86)\WiX Toolset v3*\bin` 目录，
+缺失就用 choco 装 3.14.1，并通过 `$GITHUB_PATH` 前置到 PATH（v3 优先）。
+
+### 8.3 `nativeDistributions` 里的中文让 jpackage 抛异常
+
+`desktop/build.gradle.kts` 里原本写着：
+
+```kotlin
+description = "LLM Reader —— 本地/网页小说阅读器 + 大模型翻译"
+copyright = "© zzy"
+```
+
+Windows 上 `:desktop:packageMsi` 失败，而 jpackage 自己的日志里**只有一行**：
+
+```
+Input length = 1
+```
+
+这是 `MalformedInputException` —— jpackage 在 Windows 上用**平台默认字符集**
+（不是 UTF-8）读写中间文件，遇到非 ASCII 字符就崩。macOS/Linux 默认 UTF-8，
+所以只有 Windows 会炸。
+
+**修法**：`description` / `copyright` / `vendor` 等交给 jpackage 的字符串
+一律保持纯 ASCII（注释里的中文无妨）。
+
+> 附带教训：jpackage 的真实报错只写进
+> `desktop/build/compose/logs/<task>/jpackage-*.txt`，Gradle 不会转述。
+> 工作流里加了 `Dump jpackage logs on failure` 步骤把它兜出来，
+> 否则完全看不到 "Input length = 1" 这行。
+
+### 8.4 Release 不再被单个平台拖死
+
+原先 `release` 任务用 `needs: [prepare, android, desktop]`，桌面端矩阵里
+**任意一个平台失败**，整个 Release 就被跳过 —— 明明 ubuntu 的 `.deb`、
+macOS 的 `.dmg`、Android 的 `.apk` 都已经构建成功，却一个都发不出去。
+
+**修法**：`release` 改用 `always()`，只要求 `prepare` 与 `android` 成功，
+桌面端有哪个发哪个。`v1.0.1` 第一次跑就是靠这个才发出了 3 个产物。
