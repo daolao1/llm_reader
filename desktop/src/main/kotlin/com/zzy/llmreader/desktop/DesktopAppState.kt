@@ -65,6 +65,15 @@ class DesktopAppState(
     val state: StateFlow<DesktopUiState> = _state.asStateFlow()
 
     private val webRegistry = core.createWebRegistry { _state.value.prefs }
+
+    /** 当前这本书的进度 key：本地书 = 文件绝对路径，网页书 = canonical url。 */
+    private var currentBookKey: String? = null
+
+    /**
+     * 章节抓取任务。必须持有引用，否则 `closeBook` 取消不掉，
+     * 抓取结果会在用户已经离开这本书之后把书塞回界面。
+     */
+    private val chapterFetchJobs = mutableMapOf<Int, Job>()
     private val translationJobs = mutableMapOf<Int, Job>()
     private val cacheMutex = Mutex()
 
@@ -94,7 +103,13 @@ class DesktopAppState(
                 when (book) {
                     is BookContent.Text -> {
                         val saved = withContext(Dispatchers.IO) { core.progressRepo.get(file.absolutePath) }
-                        show(book, canonical = null, sourceId = null, startChapter = saved?.chapterIndex ?: 0)
+                        show(
+                            book,
+                            canonical = null,
+                            sourceId = null,
+                            startChapter = saved?.chapterIndex ?: 0,
+                            localKey = file.absolutePath,
+                        )
                         remember(file.absolutePath, book.title, RecentBookSource.FILE)
                     }
                     is BookContent.Pdf -> _state.update {
@@ -142,8 +157,9 @@ class DesktopAppState(
                     startChapter = startChapter,
                 )
                 remember(book.url, book.title, RecentBookSource.WEB)
-                // 打开后先把当前章正文拉下来
+                // 打开后先把当前章正文拉下来，并按设置预取后续章节
                 ensureChapterLoaded(_state.value.currentChapter)
+                prefetchAround(_state.value.currentChapter)
             }.onFailure { e ->
                 _state.update { it.copy(loading = false, error = e.message ?: "抓取失败") }
             }
@@ -173,8 +189,11 @@ class DesktopAppState(
         canonical: String?,
         sourceId: String?,
         startChapter: Int,
+        /** 本地书的进度 key（绝对路径）。网页书传 null，用 canonical。 */
+        localKey: String? = null,
     ) {
         cancelTranslationJobs()
+        currentBookKey = canonical ?: localKey
         val idx = startChapter.coerceIn(0, (book.chapters.size - 1).coerceAtLeast(0))
         _state.update {
             it.copy(
@@ -194,6 +213,9 @@ class DesktopAppState(
 
     fun closeBook() {
         cancelTranslationJobs()
+        chapterFetchJobs.values.forEach { it.cancel() }
+        chapterFetchJobs.clear()
+        currentBookKey = null
         _state.update {
             it.copy(
                 book = null,
@@ -203,12 +225,25 @@ class DesktopAppState(
                 error = null,
                 translationProgress = null,
                 translatingChapters = emptySet(),
+                loadingChapters = emptySet(),
             )
         }
     }
 
     fun removeRecent(book: RecentBook) {
-        scope.launch { runCatching { core.recentRepo.remove(book.uri) } }
+        scope.launch {
+            // Android 端会连缓存一起删，桌面端旧实现只删列表项 ——
+            // 于是「删除」看起来生效了，web_books/<sha>.json 却留在磁盘上无限增长。
+            if (book.source == RecentBookSource.WEB || book.uri.startsWith("http", ignoreCase = true)) {
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        val canonical = webRegistry.find(book.uri)?.canonicalize(book.uri) ?: book.uri
+                        core.webCache.delete(canonical)
+                    }
+                }
+            }
+            runCatching { core.recentRepo.remove(book.uri) }
+        }
     }
 
     // ---------------------------------------------------------------- 阅读
@@ -235,23 +270,38 @@ class DesktopAppState(
         }
         // 同时写回偏好，否则下一次 prefs 流推送会把模式覆盖回去
         savePrefs(_state.value.prefs.copy(translationMode = next))
+
+        // 切到译文/双语时自动开翻。
+        // 旧实现只改了一个枚举值：用户点「译文」后页面纹丝不动，
+        // 而「译文本章」按钮在工具栏另一头，看起来就像功能坏了。
+        // Android 端一直是有这个联动的。
+        if (next != TranslationMode.ORIGINAL) {
+            val st = _state.value
+            val index = st.currentChapter
+            val already = st.current?.translatedContent != null
+            if (!already && index !in st.translatingChapters) {
+                translateChapter(index)
+            }
+        }
     }
 
     fun dismissError() = _state.update { it.copy(error = null) }
 
     private fun saveProgress() {
         val st = _state.value
-        val book = st.book ?: return
-        val key = st.webCanonicalUrl ?: keyForLocal(book.title)
+        if (st.book == null) return
+        // 用打开时记下的稳定 key。
+        // 旧实现是 `keyForLocal(book.title)` —— 反查 recents 拿 uri，但
+        // recents 是异步填充的，`show()` 里第一次 save 时它还没有这本书，
+        // 于是 key 落到书名上；而读取用的是 `file.absolutePath`。
+        // 对 TXT/MD/HTML 这种只有 1 章、`selectChapter` 永不触发的书来说，
+        // 这是**唯一**一次保存 —— 结果是本机 txt 的进度从来没存对过，
+        // 每次重开都回到开头。
+        val key = currentBookKey ?: return
         scope.launch {
             runCatching { core.progressRepo.save(key, st.currentChapter, 0f) }
         }
     }
-
-    /** 本地书的进度 key 用最近记录里的 uri（打开时写入的绝对路径）。 */
-    private fun keyForLocal(title: String): String =
-        _state.value.recents.firstOrNull { it.title == title && it.source == RecentBookSource.FILE }?.uri
-            ?: title
 
     /** 网页小说：按需抓取单章正文。 */
     fun ensureChapterLoaded(index: Int) {
@@ -265,7 +315,7 @@ class DesktopAppState(
         val source = webRegistry.findById(sourceId) ?: return
 
         _state.update { it.copy(loadingChapters = it.loadingChapters + index) }
-        scope.launch {
+        chapterFetchJobs[index] = scope.launch {
             runCatching {
                 val placeholder = withContext(Dispatchers.IO) { core.webCache.read(canonical) }
                     ?: error("缓存丢失，请重新打开该书")
@@ -282,13 +332,28 @@ class DesktopAppState(
                         )
                         withContext(Dispatchers.IO) { core.webCache.write(updated) }
                         val newBook = updated.toBookContent()
-                        _state.update { s -> s.copy(book = newBook) }
+                        // ⚠️ 身份校验：抓取期间用户可能已经返回书库、或换了一本书。
+                        // 旧实现无条件 `copy(book = newBook)` —— 抓取落地时会把书
+                        // 重新塞回界面，而 webCanonicalUrl / webSourceId 已被 closeBook
+                        // 清空，于是 ensureChapterLoaded 直接 return、所有章节永久卡在
+                        // 「本章暂无正文」，进度与翻译还会把网页书当本地书处理。
+                        _state.update { s ->
+                            if (s.webCanonicalUrl != canonical) s
+                            else s.copy(book = newBook, loadingChapters = s.loadingChapters - index)
+                        }
+                        return@launch
                     }
                 }
             }.onFailure { e ->
-                _state.update { it.copy(error = "第 ${index + 1} 章抓取失败：${e.message}") }
+                _state.update { s ->
+                    if (s.webCanonicalUrl != canonical) s
+                    else s.copy(
+                        error = "第 ${index + 1} 章抓取失败：${e.message}",
+                        loadingChapters = s.loadingChapters - index,
+                    )
+                }
+                return@launch
             }
-            _state.update { it.copy(loadingChapters = it.loadingChapters - index) }
         }
     }
 
@@ -296,8 +361,14 @@ class DesktopAppState(
     private fun prefetchAround(currentIndex: Int) {
         val ahead = _state.value.prefs.webPrefetchAhead
         if (ahead <= 0 || _state.value.webCanonicalUrl == null) return
-        // 只预取紧接着的 1 章，避免对站点压力过大；后续章节在翻页时再取。
-        ensureChapterLoaded(currentIndex + 1)
+        val last = _state.value.chapterCount - 1
+        // 旧实现读了 webPrefetchAhead 却只当开关用，永远只抓 currentIndex + 1，
+        // 设置成 20 和设置成 1 没有任何区别。
+        for (offset in 1..ahead) {
+            val target = currentIndex + offset
+            if (target > last) break
+            ensureChapterLoaded(target)
+        }
     }
 
     // ---------------------------------------------------------------- 翻译
@@ -334,8 +405,10 @@ class DesktopAppState(
                 val entries = if (canonical != null) {
                     withContext(Dispatchers.IO) { core.webCache.read(canonical) }?.glossary ?: emptyList()
                 } else {
-                    val key = _state.value.book?.title.orEmpty()
-                    if (key.isBlank()) emptyList()
+                    // 必须与 mergeGlossary 的写入 key 一致（currentBookKey = 文件绝对路径）。
+                    // 旧实现读写都用书名，除了同名书会串，也会因为『先读后写』顺序问题丢数据。
+                    val key = currentBookKey
+                    if (key.isNullOrBlank()) emptyList()
                     else withContext(Dispatchers.IO) { core.localGlossary.read(key) }
                 }
                 entries.joinToString("\n") { "${it.original} → ${it.translated}" }
@@ -355,6 +428,24 @@ class DesktopAppState(
                     },
                     onPartial = { partialTitle, partialHtml ->
                         applyTranslation(index, partialTitle, partialHtml)
+                    },
+                    // 每批翻完抽取人名/专有名词并落库。
+                    // 桌面端旧实现只**读**术语表（glossaryProvider），从不写入，
+                    // 也没有传 onBatchTranslated（其默认实现是空操作）——
+                    // 于是 glossaryProvider 永远返回空串，跨章译名一致性在桌面端
+                    // 根本不存在，glossaryDedupeInterval / glossaryMaxSize 是死设置。
+                    onBatchTranslated = { batchOriginal, batchTranslated ->
+                        runCatching {
+                            val extracted = core.translator.extractGlossary(
+                                _state.value.settings,
+                                targetLang,
+                                batchOriginal.joinToString("\n") { "<p>$it</p>" },
+                                batchTranslated.joinToString("\n") { "<p>$it</p>" },
+                            )
+                            if (extracted.isNotBlank()) {
+                                mergeGlossary(canonical, parseGlossaryLines(extracted))
+                            }
+                        }
                     },
                 )
             }.getOrElse { e ->
@@ -418,6 +509,55 @@ class DesktopAppState(
             }
         }
     }
+
+    /**
+     * 把新抽到的术语合并进当前书的术语表（网页书进缓存，本地书进本地存储）。
+     * 按 `original` 去重、刷新 `lastUsed`、按 `glossaryMaxSize` 做 LRU 淘汰。
+     */
+    private suspend fun mergeGlossary(
+        canonical: String?,
+        entries: List<com.zzy.llmreader.web.GlossaryEntry>,
+    ) {
+        if (entries.isEmpty()) return
+        val maxSize = _state.value.prefs.glossaryMaxSize.coerceAtLeast(1)
+        val now = System.currentTimeMillis()
+
+        if (canonical != null) {
+            cacheMutex.withLock {
+                val cached = withContext(Dispatchers.IO) { core.webCache.read(canonical) } ?: return@withLock
+                val byKey = cached.glossary.associateBy { it.original }.toMutableMap()
+                entries.forEach { e -> byKey[e.original] = e.copy(lastUsed = now) }
+                val trimmed = byKey.values.sortedByDescending { it.lastUsed }.take(maxSize)
+                withContext(Dispatchers.IO) {
+                    core.webCache.write(cached.copy(glossary = trimmed))
+                }
+            }
+            return
+        }
+
+        // 本地书：用文件名（含目录）做 key，避免同书名的两本书共用术语表
+        val key = currentBookKey ?: return
+        val existing = withContext(Dispatchers.IO) { core.localGlossary.read(key) }
+        val byKey = existing.associateBy { it.original }.toMutableMap()
+        entries.forEach { e -> byKey[e.original] = e.copy(lastUsed = now) }
+        val trimmed = byKey.values.sortedByDescending { it.lastUsed }.take(maxSize)
+        withContext(Dispatchers.IO) { core.localGlossary.write(key, trimmed) }
+    }
+
+    /** 解析 LLM 输出的术语行，兼容 `A → B`、`A -> B`、`- A → B` 等写法。 */
+    private fun parseGlossaryLines(text: String): List<com.zzy.llmreader.web.GlossaryEntry> =
+        text.lineSequence().mapNotNull { raw ->
+            val line = raw.trim().removePrefix("-").removePrefix("*").trim()
+            if (line.isBlank()) return@mapNotNull null
+            val arrow = line.indexOf('→').takeIf { it >= 0 }
+                ?: line.indexOf("->").takeIf { it >= 0 }
+                ?: return@mapNotNull null
+            val width = if (line[arrow] == '→') 1 else 2
+            val orig = line.substring(0, arrow).trim().trim('[', ']', '【', '】', '"')
+            val trans = line.substring(arrow + width).trim().trim('[', ']', '【', '】', '"')
+            if (orig.isBlank() || trans.isBlank() || orig.length > 80 || trans.length > 80) null
+            else com.zzy.llmreader.web.GlossaryEntry(original = orig, translated = trans)
+        }.toList()
 
     private fun cancelTranslationJobs() {
         translationJobs.values.forEach { it.cancel() }

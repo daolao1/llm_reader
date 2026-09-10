@@ -58,7 +58,14 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
 
     val primaryHtml = remember(chapter, mode) { primaryHtml(chapter, mode) }
     val secondaryHtml = remember(chapter, mode) {
-        if (mode == TranslationMode.BILINGUAL) chapter?.content else null
+        // 只有**确实存在译文**时才显示原文对照。
+        // 旧实现无条件取 chapter.content，于是未翻译的章节在双语模式下
+        // 会被原样印两遍，中间还加一条「—— 原文 ——」分隔线。
+        if (mode == TranslationMode.BILINGUAL && chapter?.translatedContent != null) {
+            chapter.content
+        } else {
+            null
+        }
     }
     val primaryBlocks = remember(primaryHtml) { primaryHtml.toBlocks() }
     val secondaryBlocks = remember(secondaryHtml) { secondaryHtml.toBlocks() }
@@ -86,6 +93,19 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
                     ),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
+                    if (mode != TranslationMode.ORIGINAL &&
+                        chapter.translatedContent == null &&
+                        state.currentChapter !in state.translatingChapters
+                    ) {
+                        item {
+                            Text(
+                                "这一章还没有译文，显示的是原文。" +
+                                    "点工具栏的「翻译本章」开始翻译。",
+                                color = fg.copy(alpha = 0.7f),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                     item {
                         val title = chapter.translatedTitle
                             ?.takeIf { mode != TranslationMode.ORIGINAL && it.isNotBlank() }
@@ -201,6 +221,8 @@ private fun primaryHtml(chapter: Chapter?, mode: TranslationMode): String? {
     if (chapter == null) return null
     return when (mode) {
         TranslationMode.ORIGINAL -> chapter.content
+        // 未翻译时回落到原文（翻译由 cycleTranslationMode 自动触发，
+        // 未完成期间不该是一片空白），但界面上会有「尚未翻译」的提示。
         TranslationMode.TRANSLATED -> chapter.translatedContent ?: chapter.content
         TranslationMode.BILINGUAL -> chapter.translatedContent ?: chapter.content
     }
