@@ -235,6 +235,33 @@ jobs:
         shell: bash
         run: chmod +x ./gradlew
 
+      - name: Ensure WiX Toolset v3 (jpackage 做 MSI 必需)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # jpackage 生成 .msi 依赖 WiX 的 candle.exe / light.exe。
+          # 注意：JDK 17 的 jpackage **只支持 WiX v3**（v4/v5 支持是 JDK-8319457
+          # 才加的），所以不能只判断 candle.exe 是否存在 —— runner 上可能装的是
+          # v4/v5，那样 jpackage 依然会失败。这里认准 v3 的安装目录。
+          function Find-WixV3 {
+            $hit = Get-ChildItem "C:\Program Files (x86)\WiX Toolset v3*\bin\candle.exe" `
+                     -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { return $hit.DirectoryName } else { return $null }
+          }
+
+          $wixBin = Find-WixV3
+          if (-not $wixBin) {
+            Write-Host "未找到 WiX v3，开始安装 3.14.1…"
+            choco install wixtoolset --version=3.14.1 -y --no-progress --allow-downgrade
+            $wixBin = Find-WixV3
+          }
+          if (-not $wixBin) { throw "WiX v3 安装后仍未找到，jpackage 无法生成 MSI" }
+
+          # GITHUB_PATH 里的条目会被 runner 前置到 PATH，因此 v3 优先于可能存在的 v4/v5
+          Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+          Write-Host "使用 WiX v3: $wixBin"
+          & "$wixBin\candle.exe" -? 2>&1 | Select-Object -First 2
+
       - name: Package ${{ matrix.ext }} installer
         # 三个平台统一用 bash + ./gradlew：
         # Windows runner 上 run: 默认走 PowerShell，而 PowerShell 会把
@@ -247,6 +274,17 @@ jobs:
           ./gradlew ":desktop:${{ matrix.task }}" \
             "-PversionName=${{ needs.prepare.outputs.version }}" \
             "-PversionCode=${{ needs.prepare.outputs.version_code }}"
+
+      - name: Dump jpackage logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          # jpackage 的真实报错只写进它自己的日志文件，Gradle 不会转述，这里兜出来
+          for f in desktop/build/compose/logs/${{ matrix.task }}/*; do
+            [ -f "$f" ] || continue
+            echo "===================== $f ====================="
+            cat "$f" || true
+          done
 
       - name: Show produced installer(s)
         if: always()
@@ -270,7 +308,10 @@ jobs:
       - prepare
       - android
       - desktop
-    if: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+    # 用 always() 让本任务在桌面端部分平台失败时依然执行 —— 否则一个平台挂掉
+    # 就会因为 needs 语义把整个 Release 一起拖死，其它平台已经打好的包也发不出去。
+    # 只要求 prepare 与 android 成功（APK 是主要产物），桌面端的包有哪个发哪个。
+    if: ${{ always() && needs.prepare.result == 'success' && needs.android.result == 'success' && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') }}
     permissions:
       contents: write
     timeout-minutes: 30
