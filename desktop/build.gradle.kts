@@ -41,9 +41,15 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "LLMReader"
             packageVersion = packagingVersion
-            description = "LLM Reader —— 本地/网页小说阅读器 + 大模型翻译"
+
+            // ⚠️ 以下字符串务必保持纯 ASCII。
+            // jpackage 在 Windows 上用**平台默认字符集**（不是 UTF-8）读写中间文件，
+            // 一旦 description / copyright 里出现中文或 © 这类非 ASCII 字符，
+            // 它就会抛 MalformedInputException（报错信息只有一行 "Input length = 1"）
+            // 并让 :desktop:packageMsi 直接失败 —— macOS/Linux 默认 UTF-8 所以看不出来。
+            description = "LLM Reader - local & online novel reader with LLM translation"
             vendor = "zzy"
-            copyright = "© zzy"
+            copyright = "(c) zzy"
         }
     }
 }
