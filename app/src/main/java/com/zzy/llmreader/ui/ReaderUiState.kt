@@ -62,6 +62,8 @@ data class ReaderUiState(
     val bookDetail: BookDetailUiState? = null,
     /** 当前章节首次显示时使用的初始滚动百分比（0..1），从持久化进度恢复。 */
     val initialChapterScrollFraction: Float = 0f,
+    /** 正在重新抓取网页小说的目录（连载更新后刷新用）。 */
+    val tocRefreshing: Boolean = false,
 )
 
 /** 发现页 UI 状态：站点 / 当前查询 / 结果 / 加载与错误。 */

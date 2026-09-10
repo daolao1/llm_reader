@@ -491,20 +491,45 @@ private fun DiscoveryListPane(
                     title = "没有结果",
                     message = "换个分类、排序，或清掉关键字试试。",
                 )
-                else -> LazyColumn(
-                    state = gridState,
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(vertical = 4.dp),
-                ) {
-                    items(state.items, key = { it.id }) { item ->
-                        BookCard(
-                            item = item,
-                            showTranslated = state.translateListings,
-                            translating = item.id in state.translating,
-                            onClick = { onShowDetail(item.id) },
-                            onTagClick = { tag ->
-                                onUpdateQuery { withTag(tag).copy(page = caps.firstPage) }
-                            },
+                else -> Column(modifier = Modifier.fillMaxSize()) {
+                    // 列表非空时的错误也要显示：旧版只在「列表为空」时渲染 error，
+                    // 于是翻页失败、重新搜索失败完全静默 —— 用户只看到列表没变化。
+                    state.error?.let { msg ->
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    msg,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                // 列表非空还报错，必然是「加载下一页」失败
+                                // （重新搜索会先清空列表，那时走的是上面的 ErrorBlock），
+                                // 所以这里直接重试翻页。
+                                TextButton(onClick = { onLoadMore() }) { Text("重试") }
+                            }
+                        }
+                    }
+                    LazyColumn(
+                        state = gridState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(vertical = 4.dp),
+                    ) {
+                        items(state.items, key = { it.id }) { item ->
+                            BookCard(
+                                item = item,
+                                showTranslated = state.translateListings,
+                                translating = item.id in state.translating,
+                                onClick = { onShowDetail(item.id) },
+                                onTagClick = { tag ->
+                                    onUpdateQuery { withTag(tag).copy(page = caps.firstPage) }
+                                },
                         )
                         HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
                     }
@@ -519,6 +544,7 @@ private fun DiscoveryListPane(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
+                }
                         }
                     }
                 }

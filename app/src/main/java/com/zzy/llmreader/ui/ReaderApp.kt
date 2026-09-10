@@ -39,6 +39,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Link
@@ -137,6 +139,8 @@ fun ReaderApp(
     var showImagePanel by remember { mutableStateOf(false) }
     var showOverflow by remember { mutableStateOf(false) }
     var chromeVisible by remember { mutableStateOf(true) }
+    // Toast 用来把「保存时被忽略的条目」这类信息明确告诉用户，而不是静默丢弃
+    val ctx = androidx.compose.ui.platform.LocalContext.current
     val snackbarHost = remember { SnackbarHostState() }
 
     // CF 拦截后自动弹验证 Activity；拿到 cookie 后 ViewModel 自动重试。
@@ -299,6 +303,20 @@ fun ReaderApp(
                                 )
                                 val isOriginalMode = state.readerPrefs.translationMode == TranslationMode.ORIGINAL
                                 DropdownMenuItem(
+                                    text = { Text(if (chromeVisible) "隐藏顶栏（沉浸式）" else "显示顶栏") },
+                                    leadingIcon = {
+                                        Icon(
+                                            if (chromeVisible) Icons.Default.VisibilityOff
+                                            else Icons.Default.Visibility,
+                                            contentDescription = null,
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflow = false
+                                        chromeVisible = !chromeVisible
+                                    },
+                                )
+                                DropdownMenuItem(
                                     text = { Text("重新翻译本章") },
                                     leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
                                     enabled = !state.loading
@@ -313,10 +331,25 @@ fun ReaderApp(
                                     DropdownMenuItem(
                                         text = { Text("重新下载本章") },
                                         leadingIcon = { Icon(Icons.Default.CloudDownload, contentDescription = null) },
-                                        enabled = !state.loading && isOriginalMode,
+                                        enabled = !state.loading
+                                            && state.currentChapter !in state.loadingChapters,
                                         onClick = {
                                             showOverflow = false
-                                            viewModel.refreshCurrentWebBook()
+                                            viewModel.reDownloadChapter(state.currentChapter)
+                                        },
+                                    )
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                if (state.tocRefreshing) "正在刷新目录…"
+                                                else "刷新目录（保留译文）",
+                                            )
+                                        },
+                                        leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
+                                        enabled = !state.loading && !state.tocRefreshing,
+                                        onClick = {
+                                            showOverflow = false
+                                            viewModel.refreshToc()
                                         },
                                     )
                                 }
@@ -380,7 +413,6 @@ fun ReaderApp(
                         padding = padding,
                         state = state,
                         chromeVisible = chromeVisible,
-                        onToggleChrome = { chromeVisible = !chromeVisible },
                         onCycleTheme = viewModel::cycleReadingTheme,
                         onSelectChapter = viewModel::selectChapter,
                         onSelectChapterAtEnd = viewModel::selectChapterAtEnd,
@@ -437,7 +469,13 @@ fun ReaderApp(
             entries = viewModel.getGlossary(),
             onDismiss = { showGlossary = false },
             onSave = { entries ->
-                viewModel.saveGlossary(entries)
+                viewModel.saveGlossary(entries) { dropped ->
+                    android.widget.Toast.makeText(
+                        ctx,
+                        "已忽略 $dropped 条无效条目（空行、整句或过长文本）",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
                 showGlossary = false
             },
             onDedupe = { callback -> viewModel.deduplicateGlossaryManual(callback) },
@@ -1173,7 +1211,6 @@ private fun ReaderScreen(
     padding: PaddingValues,
     state: ReaderUiState,
     chromeVisible: Boolean,
-    onToggleChrome: () -> Unit,
     onCycleTheme: () -> Unit,
     onSelectChapter: (Int) -> Unit,
     onSelectChapterAtEnd: (Int) -> Unit = onSelectChapter,
@@ -1195,7 +1232,6 @@ private fun ReaderScreen(
             readingTheme = state.readerPrefs.readingTheme,
             chromeVisible = chromeVisible,
             failedTranslations = state.failedTranslations,
-            onToggleChrome = onToggleChrome,
             onCycleTheme = onCycleTheme,
             onSelectChapter = onSelectChapter,
             onSelectChapterAtEnd = onSelectChapterAtEnd,
@@ -1208,8 +1244,6 @@ private fun ReaderScreen(
         is BookContent.Pdf -> PdfReader(
             padding = padding,
             book = book,
-            fontScale = state.fontScale,
-            onSetFontScale = onSetFontScale,
         )
         null -> Unit
     }

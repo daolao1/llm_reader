@@ -369,11 +369,129 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun refreshCurrentWebBook() {
-        val book = _state.value.book ?: return
-        val recent = recents.value.firstOrNull { it.title == book.title && it.source == RecentBookSource.WEB }
-            ?: return
-        openWebBook(recent.uri, forceRefresh = true)
+    /**
+     * 重新下载**当前这一章**的正文。
+     *
+     * 旧实现走的是 `openWebBook(forceRefresh = true)` —— 那会跳过缓存重新抓整份目录，
+     * 而新目录里每一章的 `html` / `translatedHtml` 都是 null，落盘后
+     * 「已下载的全部章节 + 全部 LLM 译文 + 术语表」一起消失。菜单上写「本章」，
+     * 行为却是整本，属于无声的数据丢失。
+     *
+     * 这里改成只抓单章 + 锁内读-改-写合并，其余章节原样保留。
+     * 译文刻意**不**清空：重抓的是原文，译文是花钱换来的；想更新译文用户会自己点
+     * 「重新翻译本章」。
+     */
+    fun reDownloadChapter(index: Int) {
+        val cur = _state.value
+        val canonical = cur.webCanonicalUrl ?: return
+        val sourceId = cur.webSourceId ?: return
+        val book = cur.book as? BookContent.Text ?: return
+        if (index !in book.chapters.indices) return
+        if (index in cur.loadingChapters) return
+        val source = webRegistry.findById(sourceId) ?: return
+
+        _state.update { it.copy(loadingChapters = it.loadingChapters + index) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val placeholder = withContext(Dispatchers.IO) { webCache.read(canonical) }
+                    ?.chapters?.getOrNull(index)
+                    ?: error("缓存丢失，请刷新目录")
+                val fetched = source.fetchChapter(canonical, index, placeholder)
+                cacheMutex.withLock {
+                    val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
+                        ?: error("缓存丢失，请刷新目录")
+                    val updated = cached.copy(
+                        chapters = cached.chapters.toMutableList().apply {
+                            val old = this[index]
+                            // 只替换正文与章节信息，译文/译名/语言标记全部保留
+                            this[index] = fetched.copy(
+                                translatedHtml = old.translatedHtml,
+                                translatedTitle = old.translatedTitle,
+                                translationLanguage = old.translationLanguage,
+                            )
+                        },
+                    )
+                    withContext(Dispatchers.IO) { webCache.write(updated) }
+                    updated
+                }
+            }
+            result.onSuccess { updated ->
+                _state.update { state ->
+                    // 身份校验：期间切了书就不要把结果写回去
+                    if (state.webCanonicalUrl != canonical) state
+                    else state.copy(book = updated.toBookContent())
+                }
+            }.onFailure { e ->
+                _state.update { it.copy(error = "重新下载失败：${e.message}") }
+            }
+            _state.update { it.copy(loadingChapters = it.loadingChapters - index) }
+        }
+    }
+
+    /**
+     * 重新抓目录（连载更新后用）。
+     *
+     * 与 [reDownloadChapter] 同样是安全合并：已有章节按 `chapterUrl` 对齐后只更新
+     * 标题/分组，**已下载的正文、LLM 译文和术语表全部保留**；站点新增的章节会追加，
+     * 站点删掉的章节会移除。
+     */
+    fun refreshToc() {
+        val cur = _state.value
+        val canonical = cur.webCanonicalUrl ?: return
+        val sourceId = cur.webSourceId ?: return
+        if (cur.tocRefreshing) return
+        val source = webRegistry.findById(sourceId) ?: return
+
+        _state.update { it.copy(tocRefreshing = true) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val fresh = source.fetchIndex(canonical) { _, _, _ -> }
+                cacheMutex.withLock {
+                    val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
+                        ?: error("缓存丢失")
+                    val oldByUrl = cached.chapters
+                        .mapNotNull { c -> c.chapterUrl?.let { it to c } }
+                        .toMap()
+                    val merged = fresh.chapters.mapIndexed { idx, f ->
+                        // 优先按 URL 对齐；没有 chapterUrl 的退化实现按下标对齐
+                        val old = f.chapterUrl?.let { oldByUrl[it] }
+                            ?: cached.chapters.getOrNull(idx)?.takeIf { it.chapterUrl == null }
+                        if (old == null) {
+                            f
+                        } else {
+                            old.copy(
+                                title = f.title.ifBlank { old.title },
+                                groupTitle = f.groupTitle ?: old.groupTitle,
+                            )
+                        }
+                    }
+                    val updated = cached.copy(
+                        title = fresh.title.ifBlank { cached.title },
+                        chapters = merged,
+                    )
+                    withContext(Dispatchers.IO) { webCache.write(updated) }
+                    updated
+                }
+            }
+            result.onSuccess { updated ->
+                _state.update { state ->
+                    if (state.webCanonicalUrl != canonical) {
+                        state
+                    } else {
+                        state.copy(
+                            book = updated.toBookContent(),
+                            // 目录可能增删，把当前章夹回合法范围
+                            currentChapter = state.currentChapter
+                                .coerceIn(0, (updated.chapters.size - 1).coerceAtLeast(0)),
+                            error = null,
+                        )
+                    }
+                }
+            }.onFailure { e ->
+                _state.update { it.copy(error = "刷新目录失败：${e.message}") }
+            }
+            _state.update { it.copy(tocRefreshing = false) }
+        }
     }
 
     /**
@@ -1431,13 +1549,27 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 保存用户手动编辑后的术语表。 */
-    fun saveGlossary(entries: List<com.zzy.llmreader.web.GlossaryEntry>) {
+    /**
+     * 保存术语表。
+     *
+     * 会过滤掉明显不是术语的条目（空、含句末标点的整句、超长文本），
+     * 但**不再静默丢弃** —— 丢弃条数通过 [onDropped] 回传，由 UI 告诉用户。
+     * 长度上限从 40 放宽到 80，与 `ChapterTranslator.filterGlossaryLines`
+     * 注入时用的上限对齐：旧版一边允许 80 字的一行存在、一边在保存时删掉它，
+     * 用户会发现条目「自己消失了」。
+     */
+    fun saveGlossary(
+        entries: List<com.zzy.llmreader.web.GlossaryEntry>,
+        onDropped: (Int) -> Unit = {},
+    ) {
         val cleaned = entries.filter { e ->
             e.original.isNotBlank() && e.translated.isNotBlank() &&
-                e.original.length <= 40 && e.translated.length <= 40 &&
+                e.original.length <= 80 && e.translated.length <= 80 &&
                 e.original.none { it in ".。;；?？!！" } &&
                 e.translated.none { it in ".。;；?？!！" }
         }
+        val dropped = entries.size - cleaned.size
+        if (dropped > 0) onDropped(dropped)
         val canonical = _state.value.webCanonicalUrl
         if (canonical != null) {
             viewModelScope.launch {
@@ -1477,22 +1609,11 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
             val glossaryText = current.joinToString("\n") { "${it.original} → ${it.translated}" }
             val result = runCatching {
                 val deduped = translator.deduplicateGlossary(settings, glossaryText)
-                if (deduped.isNotBlank()) {
-                    val dedupedEntries = parseGlossaryText(deduped)
-                    if (dedupedEntries.isNotEmpty()) {
-                        if (canonical != null) {
-                            cacheMutex.withLock {
-                                val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                                    ?: return@withLock
-                                val updated = cached.copy(glossary = dedupedEntries)
-                                withContext(Dispatchers.IO) { webCache.write(updated) }
-                            }
-                        } else {
-                            withContext(Dispatchers.IO) { localGlossary.write(localKey!!, dedupedEntries) }
-                        }
-                        dedupedEntries
-                    } else current
-                } else current
+                val dedupedEntries = if (deduped.isNotBlank()) parseGlossaryText(deduped) else emptyList()
+                // ⚠️ 只回传结果，**不落盘**。
+                // 旧实现把合并结果直接写进缓存，于是用户在对话框里点「取消」
+                // 也照样生效 —— 取消按钮形同虚设。现在由用户点「保存」才写入。
+                if (dedupedEntries.isNotEmpty()) dedupedEntries else current
             }
             callback(result)
         }

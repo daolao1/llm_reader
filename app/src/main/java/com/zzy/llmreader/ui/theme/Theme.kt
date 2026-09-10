@@ -172,6 +172,17 @@ val NightReaderColors = darkColorScheme(
     outline = Color(0xFF55504A),
 )
 
+/**
+ * 阅读区当前生效的字体。
+ *
+ * 正文是用 `AndroidView` + `TextView` 渲染的（为了 Spanned 富文本和文本选择），
+ * 它**不继承** Compose 的 typography —— 所以「阅读字体」只改菜单文字、正文纹丝不动。
+ * 这里把设置透出去，让 TextReader 能把它转成 Android Typeface。
+ */
+val LocalReaderFontFamily = androidx.compose.runtime.compositionLocalOf {
+    ReaderFontFamily.SYSTEM
+}
+
 /** 在阅读区内套一层 MaterialTheme，仅替换 colorScheme，保留 typography（含字体）。 */
 @Composable
 fun ReaderThemeOverride(
@@ -185,5 +196,15 @@ fun ReaderThemeOverride(
         com.zzy.llmreader.data.ReadingTheme.NIGHT -> NightReaderColors
     }
     val typography = ReaderTypography.withFontFamily(fontFamily.toFontFamily())
-    MaterialTheme(colorScheme = colors, typography = typography, content = content)
+    androidx.compose.runtime.CompositionLocalProvider(LocalReaderFontFamily provides fontFamily) {
+        MaterialTheme(colorScheme = colors, typography = typography, content = content)
+    }
+}
+
+/** 把用户选的字体映射成 Android Typeface；null = 交给系统默认。 */
+fun ReaderFontFamily.toTypeface(): android.graphics.Typeface? = when (this) {
+    ReaderFontFamily.SYSTEM -> null
+    ReaderFontFamily.SERIF -> android.graphics.Typeface.SERIF
+    ReaderFontFamily.SANS_SERIF -> android.graphics.Typeface.SANS_SERIF
+    ReaderFontFamily.MONOSPACE -> android.graphics.Typeface.MONOSPACE
 }

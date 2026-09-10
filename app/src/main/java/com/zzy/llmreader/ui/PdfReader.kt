@@ -40,11 +40,12 @@ import kotlinx.coroutines.withContext
 fun PdfReader(
     padding: PaddingValues,
     book: BookContent.Pdf,
-    fontScale: Float,
-    onSetFontScale: (Float) -> Unit,
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
+    // PDF 的缩放是**局部状态**：旧版直接借用阅读页的字号（onSetFontScale），
+    // 结果缩放一次 PDF，所有小说的正文字号也跟着变了。
+    var zoom by remember(book.sourceUri) { mutableStateOf(1f) }
     val pager = remember(book.sourceUri) {
         runCatching { PdfPager(context, Uri.parse(book.sourceUri)) }
     }
@@ -81,14 +82,14 @@ fun PdfReader(
         ) {
             Text("共 ${pp.pageCount} 页", style = MaterialTheme.typography.titleSmall)
             Row {
-                Button(onClick = { onSetFontScale(fontScale - 0.1f) }) { Text("缩小") }
+                Button(onClick = { zoom = (zoom - 0.1f).coerceIn(0.5f, 3f) }) { Text("缩小") }
                 Text(
-                    "%.1fx".format(fontScale),
+                    "%.1fx".format(zoom),
                     modifier = Modifier
                         .padding(horizontal = 8.dp)
                         .align(Alignment.CenterVertically),
                 )
-                Button(onClick = { onSetFontScale(fontScale + 0.1f) }) { Text("放大") }
+                Button(onClick = { zoom = (zoom + 0.1f).coerceIn(0.5f, 3f) }) { Text("放大") }
             }
         }
         HorizontalDivider()
@@ -98,7 +99,7 @@ fun PdfReader(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(pp.pageCount) { index ->
-                PdfPageItem(pager = pp, pageIndex = index, scale = fontScale)
+                PdfPageItem(pager = pp, pageIndex = index, scale = zoom)
             }
         }
     }

@@ -76,6 +76,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.zzy.llmreader.ui.theme.LocalReaderFontFamily
+import com.zzy.llmreader.ui.theme.toTypeface
 import com.zzy.llmreader.data.ReadingTheme
 import com.zzy.llmreader.data.TranslationMode
 import com.zzy.llmreader.model.BookContent
@@ -95,7 +97,6 @@ fun TextReader(
     readingTheme: ReadingTheme = ReadingTheme.DAY,
     chromeVisible: Boolean = true,
     failedTranslations: Map<Int, String> = emptyMap(),
-    onToggleChrome: () -> Unit = {},
     onCycleTheme: () -> Unit = {},
     onSelectChapter: (Int) -> Unit,
     /** 跳到指定章节并定位到该章末尾（翻页翻到章首再往前时用）。 */
@@ -227,7 +228,6 @@ fun TextReader(
                 canNextChapter = safeIndex < book.chapters.size - 1,
                 onPrevChapter = { if (safeIndex > 0) onSelectChapter(safeIndex - 1) },
                 onNextChapter = { if (safeIndex < book.chapters.size - 1) onSelectChapter(safeIndex + 1) },
-                onToggleChrome = onToggleChrome,
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -576,7 +576,6 @@ private fun ChapterPage(
     canNextChapter: Boolean = false,
     onPrevChapter: () -> Unit = {},
     onNextChapter: () -> Unit = {},
-    onToggleChrome: () -> Unit = {},
 ) {
     // Chapter.content 在 shared 里是 HTML 字符串；这里转成 TextView 用的 Spanned。
     val original: Spanned? = remember(chapter?.content) { htmlToSpanned(chapter?.content) }
@@ -1145,6 +1144,7 @@ private fun SpannedTextScroll(
 ) {
     val baseTextColor = MaterialTheme.colorScheme.onSurface.toArgb()
     val linkColor = MaterialTheme.colorScheme.primary.toArgb()
+    val typeface = LocalReaderFontFamily.current.toTypeface()
     AndroidView(
         modifier = modifier.verticalScroll(scrollState),
         factory = { ctx ->
@@ -1162,6 +1162,8 @@ private fun SpannedTextScroll(
             view.setTextColor(baseTextColor)
             view.setLinkTextColor(linkColor)
             view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f * fontScale)
+            // 「阅读字体」设置必须落到正文上 —— TextView 不继承 Compose typography
+            view.typeface = typeface
             view.text = applyParagraphStyle(spanned, view.textSize)
         },
     )
@@ -1179,6 +1181,7 @@ private fun SpannedText(
         if (dimmed) MaterialTheme.colorScheme.onSurfaceVariant.toArgb()
         else MaterialTheme.colorScheme.onSurface.toArgb()
     val linkColor = MaterialTheme.colorScheme.primary.toArgb()
+    val typeface = LocalReaderFontFamily.current.toTypeface()
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
@@ -1193,6 +1196,7 @@ private fun SpannedText(
             view.setTextColor(color)
             view.setLinkTextColor(linkColor)
             view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f * fontScale)
+            view.typeface = typeface
             view.text = applyParagraphStyle(spanned, view.textSize)
         },
     )
