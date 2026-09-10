@@ -161,7 +161,9 @@ class DesktopAppState(
                 ensureChapterLoaded(_state.value.currentChapter)
                 prefetchAround(_state.value.currentChapter)
             }.onFailure { e ->
-                _state.update { it.copy(loading = false, error = e.message ?: "抓取失败") }
+                _state.update {
+                    it.copy(loading = false, error = friendlyFetchError(e, source.displayName))
+                }
             }
         }
     }
@@ -558,6 +560,22 @@ class DesktopAppState(
             if (orig.isBlank() || trans.isBlank() || orig.length > 80 || trans.length > 80) null
             else com.zzy.llmreader.web.GlossaryEntry(original = orig, translated = trans)
         }.toList()
+
+    /**
+     * 把抓取异常翻译成用户能照做的提示。
+     *
+     * 桌面端**没有内嵌浏览器**，所以不能像 Android 那样直接弹 WebView 过验证 ——
+     * 旧实现把原始异常文本（「Cloudflare 拦截（HTTP 403）：<url>」）直接甩给用户，
+     * 他既不知道该怎么办，也不知道设置里其实可以粘 cookie。
+     */
+    private fun friendlyFetchError(e: Throwable, siteName: String): String =
+        when (e) {
+            is com.zzy.llmreader.web.CloudflareBlockedException ->
+                "$siteName 被 Cloudflare 拦截了（HTTP ${e.httpStatus}）。\n" +
+                    "桌面端没有内嵌浏览器，请在浏览器里打开该站点完成验证，" +
+                    "然后到「设置 → 站点登录」把 cf_clearance 粘贴进来。"
+            else -> e.message ?: "抓取失败"
+        }
 
     private fun cancelTranslationJobs() {
         translationJobs.values.forEach { it.cancel() }

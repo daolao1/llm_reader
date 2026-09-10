@@ -33,16 +33,33 @@ import com.zzy.llmreader.data.AppTheme
 import com.zzy.llmreader.data.LlmSettings
 import com.zzy.llmreader.data.ReaderPreferences
 import com.zzy.llmreader.data.ReadingTheme
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 
 @Composable
 fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () -> Unit) {
-    var baseUrl by remember { mutableStateOf(state.settings.baseUrl) }
-    var apiKey by remember { mutableStateOf(state.settings.apiKey) }
-    var model by remember { mutableStateOf(state.settings.model) }
-    var language by remember { mutableStateOf(state.prefs.translationLanguage) }
-    var style by remember { mutableStateOf(state.prefs.translationStyle) }
-    var batchChars by remember { mutableStateOf(state.prefs.translationBatchChars.toString()) }
-    var prefetchAhead by remember { mutableStateOf(state.prefs.webPrefetchAhead.toString()) }
+    // remember 带 key：设置是异步从 DataStore 到达的，
+    // 若在首次发射之前打开面板，无 key 的 remember 会一直保留空白初值，
+    // 此时点「保存」就会用空字符串覆盖掉已存好的配置。
+    var baseUrl by remember(state.settings) { mutableStateOf(state.settings.baseUrl) }
+    var apiKey by remember(state.settings) { mutableStateOf(state.settings.apiKey) }
+    var model by remember(state.settings) { mutableStateOf(state.settings.model) }
+    var language by remember(state.prefs) { mutableStateOf(state.prefs.translationLanguage) }
+    var style by remember(state.prefs) { mutableStateOf(state.prefs.translationStyle) }
+    var batchChars by remember(state.prefs) { mutableStateOf(state.prefs.translationBatchChars.toString()) }
+    var prefetchAhead by remember(state.prefs) { mutableStateOf(state.prefs.webPrefetchAhead.toString()) }
+
+    // ---- 站点登录（桌面端没有内嵌浏览器，只能手动粘贴）----
+    var pixivCookie by remember(state.prefs) { mutableStateOf(state.prefs.pixivPhpSessId) }
+    var hamelnCookie by remember(state.prefs) { mutableStateOf(state.prefs.hamelnCookie) }
+    var hamelnUa by remember(state.prefs) { mutableStateOf(state.prefs.hamelnUserAgent) }
+    var scribblehubCookie by remember(state.prefs) { mutableStateOf(state.prefs.scribblehubCookie) }
+    var scribblehubUa by remember(state.prefs) { mutableStateOf(state.prefs.scribblehubUserAgent) }
+    var ao3Cookie by remember(state.prefs) { mutableStateOf(state.prefs.ao3Cookie) }
+    var ao3Ua by remember(state.prefs) { mutableStateOf(state.prefs.ao3UserAgent) }
+    var expandedSite by remember { mutableStateOf<String?>(null) }
+    var showApiKey by remember { mutableStateOf(false) }
 
     var models by remember { mutableStateOf<List<String>>(emptyList()) }
     var fetching by remember { mutableStateOf(false) }
@@ -73,6 +90,16 @@ fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () ->
                     onValueChange = { apiKey = it },
                     label = { Text("API Key") },
                     singleLine = true,
+                    visualTransformation = if (showApiKey) {
+                        VisualTransformation.None
+                    } else {
+                        PasswordVisualTransformation()
+                    },
+                    trailingIcon = {
+                        TextButton(onClick = { showApiKey = !showApiKey }) {
+                            Text(if (showApiKey) "隐藏" else "显示")
+                        }
+                    },
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Row(
@@ -164,6 +191,65 @@ fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () ->
                 )
 
                 Spacer(Modifier.height(4.dp))
+                SectionTitle("站点登录（按需）")
+                Text(
+                    "桌面端没有内嵌浏览器，遇到 Cloudflare 拦截或需要登录时，只能手动粘贴 cookie。\n" +
+                        "获取方式：用浏览器打开站点并通过验证 → F12 → Application → Cookies → " +
+                        "复制 cf_clearance（Pixiv 是 PHPSESSID）。不填也能用，只是部分内容拉不到。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                SiteCredentialGroup(
+                    title = "Pixiv",
+                    summary = if (pixivCookie.isBlank()) "未登录（只能看全年龄）" else "已填 PHPSESSID",
+                    expanded = expandedSite == "pixiv",
+                    onToggle = { expandedSite = if (expandedSite == "pixiv") null else "pixiv" },
+                ) {
+                    OutlinedTextField(
+                        value = pixivCookie,
+                        onValueChange = { pixivCookie = it },
+                        label = { Text("PHPSESSID") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                SiteCredentialGroup(
+                    title = "Hameln (syosetu.org)",
+                    summary = if (hamelnCookie.isBlank()) "未填" else "已填 cookie",
+                    expanded = expandedSite == "hameln",
+                    onToggle = { expandedSite = if (expandedSite == "hameln") null else "hameln" },
+                ) {
+                    CookieAndUa(
+                        cookie = hamelnCookie, onCookie = { hamelnCookie = it },
+                        ua = hamelnUa, onUa = { hamelnUa = it },
+                    )
+                }
+                SiteCredentialGroup(
+                    title = "ScribbleHub",
+                    summary = if (scribblehubCookie.isBlank()) "未填" else "已填 cookie",
+                    expanded = expandedSite == "scribblehub",
+                    onToggle = { expandedSite = if (expandedSite == "scribblehub") null else "scribblehub" },
+                ) {
+                    CookieAndUa(
+                        cookie = scribblehubCookie, onCookie = { scribblehubCookie = it },
+                        ua = scribblehubUa, onUa = { scribblehubUa = it },
+                    )
+                }
+                SiteCredentialGroup(
+                    title = "AO3",
+                    summary = if (ao3Cookie.isBlank()) "未填" else "已填 cookie",
+                    expanded = expandedSite == "ao3",
+                    onToggle = { expandedSite = if (expandedSite == "ao3") null else "ao3" },
+                ) {
+                    CookieAndUa(
+                        cookie = ao3Cookie, onCookie = { ao3Cookie = it },
+                        ua = ao3Ua, onUa = { ao3Ua = it },
+                    )
+                }
+
+                Spacer(Modifier.height(4.dp))
                 SectionTitle("外观")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     AppTheme.entries.forEach { t ->
@@ -216,6 +302,13 @@ fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () ->
                             ?.coerceIn(500, 20000) ?: state.prefs.translationBatchChars,
                         webPrefetchAhead = prefetchAhead.toIntOrNull()
                             ?.coerceIn(0, 20) ?: state.prefs.webPrefetchAhead,
+                        pixivPhpSessId = pixivCookie.trim(),
+                        hamelnCookie = hamelnCookie.trim(),
+                        hamelnUserAgent = hamelnUa.trim(),
+                        scribblehubCookie = scribblehubCookie.trim(),
+                        scribblehubUserAgent = scribblehubUa.trim(),
+                        ao3Cookie = ao3Cookie.trim(),
+                        ao3UserAgent = ao3Ua.trim(),
                     ),
                 )
                 onDismiss()
@@ -230,5 +323,70 @@ private fun SectionTitle(text: String) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(text, style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.width(8.dp))
+    }
+}
+
+/** 折叠的站点凭据组：默认只显示一行状态，需要时才展开。 */
+@Composable
+private fun SiteCredentialGroup(
+    title: String,
+    summary: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggle),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(if (expanded) "▾" else "▸", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.width(6.dp))
+                Text(title, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                Text(
+                    summary,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (expanded) {
+                Spacer(Modifier.height(6.dp))
+                content()
+            }
+        }
+    }
+}
+
+/** cookie + User-Agent。UA 是过验证时自动写回的，与 cf_clearance 绑定，一般不用手填。 */
+@Composable
+private fun CookieAndUa(
+    cookie: String,
+    onCookie: (String) -> Unit,
+    ua: String,
+    onUa: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        OutlinedTextField(
+            value = cookie,
+            onValueChange = onCookie,
+            label = { Text("cf_clearance cookie") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = ua,
+            onValueChange = onUa,
+            label = { Text("User-Agent（与 cookie 绑定）") },
+            supportingText = { Text("浏览器 F12 → Network → 任意请求的 User-Agent；留空则用默认 UA") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
