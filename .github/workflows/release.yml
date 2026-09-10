@@ -210,17 +210,14 @@ jobs:
         include:
           - os: ubuntu-latest
             task: packageDeb
-            gradle: ./gradlew
             out_dir: deb
             ext: deb
           - os: windows-latest
             task: packageMsi
-            gradle: ./gradlew.bat
             out_dir: msi
             ext: msi
           - os: macos-latest
             task: packageDmg
-            gradle: ./gradlew
             out_dir: dmg
             ext: dmg
     steps:
@@ -235,12 +232,21 @@ jobs:
           cache: gradle
 
       - name: Make Gradle wrapper executable
-        if: runner.os != 'Windows'
+        shell: bash
         run: chmod +x ./gradlew
 
       - name: Package ${{ matrix.ext }} installer
-        # 版本号已在 prepare 任务里校验过，可以安全内联
-        run: ${{ matrix.gradle }} :desktop:${{ matrix.task }} -PversionName=${{ needs.prepare.outputs.version }} -PversionCode=${{ needs.prepare.outputs.version_code }}
+        # 三个平台统一用 bash + ./gradlew：
+        # Windows runner 上 run: 默认走 PowerShell，而 PowerShell 会把
+        # "-PversionName=1.0.0" 在第一个点处拆成 -PversionName=1 与 .0.0，
+        # 后者被 Gradle 当成任务名报 "Task '.0.0' not found"。改用 bash 后
+        # 参数解析语义与 Linux/macOS 完全一致（windows-latest 自带 Git Bash）。
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew ":desktop:${{ matrix.task }}" \
+            "-PversionName=${{ needs.prepare.outputs.version }}" \
+            "-PversionCode=${{ needs.prepare.outputs.version_code }}"
 
       - name: Show produced installer(s)
         if: always()
