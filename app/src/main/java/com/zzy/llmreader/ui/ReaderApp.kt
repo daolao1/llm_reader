@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Link
@@ -349,6 +350,8 @@ fun ReaderApp(
                 onOpenRecent = viewModel::openRecent,
                 onRemoveRecent = viewModel::removeRecent,
                 onShowDetail = viewModel::openBookDetailFromRecent,
+                llmConfigured = state.settings.apiKey.isNotBlank(),
+                onOpenSettings = { showSettings = true },
             )
             else -> ReaderThemeOverride(
                 state.readerPrefs.readingTheme,
@@ -641,6 +644,8 @@ private fun LibraryScreen(
     onOpenRecent: (RecentBook) -> Unit,
     onRemoveRecent: (RecentBook) -> Unit,
     onShowDetail: (RecentBook) -> Unit = {},
+    llmConfigured: Boolean = true,
+    onOpenSettings: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -648,8 +653,35 @@ private fun LibraryScreen(
             .padding(padding)
             .padding(horizontal = 16.dp),
     ) {
+        // 必填项还没填时，把入口直接摆到书库页 —— 否则用户要翻译时才发现没配置，
+        // 而设置面板里有十几个字段，不知道该填哪几个。
+        if (!llmConfigured) {
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp)
+                    .clickable(onClick = onOpenSettings),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("还没配置大模型", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "翻译功能需要 Base URL / API Key / Model 三项，点这里去填 →",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
         Text(
-            "本地格式：TXT · Markdown · HTML · EPUB · PDF\n网站支持：Literotica · Syosetu / Novel18 · AO3",
+            "本地格式：TXT · Markdown · HTML · EPUB · PDF\n" +
+                "网站支持：Literotica · Syosetu/Novel18 · AO3 · Pixiv · Hameln · Kakuyomu · ScribbleHub · Royal Road",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 12.dp, bottom = 8.dp),
@@ -921,520 +953,6 @@ private fun readClipboard(context: Context): String? {
     return text?.trim()?.takeIf { it.isNotBlank() }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun SettingsDialog(
-    initial: LlmSettings,
-    initialPrefs: ReaderPreferences,
-    onDismiss: () -> Unit,
-    onSave: (LlmSettings, ReaderPreferences) -> Unit,
-    onFetchModels: (LlmSettings, (Result<List<String>>) -> Unit) -> Unit,
-    onCloudflareCookieCaptured: (cookie: String, userAgent: String) -> Unit = { _, _ -> },
-    onScribblehubCookieCaptured: (cookie: String, userAgent: String) -> Unit = { _, _ -> },
-    onAo3CookieCaptured: (cookie: String, userAgent: String) -> Unit = { _, _ -> },
-) {
-    var baseUrl by remember { mutableStateOf(initial.baseUrl) }
-    var apiKey by remember { mutableStateOf(initial.apiKey) }
-    var model by remember { mutableStateOf(initial.model) }
-    var modelList by remember { mutableStateOf(emptyList<String>()) }
-    var modelDropdownExpanded by remember { mutableStateOf(false) }
-    var modelLoading by remember { mutableStateOf(false) }
-    var modelError by remember { mutableStateOf<String?>(null) }
-    var prefetchAhead by remember {
-        mutableStateOf(initialPrefs.webPrefetchAhead.toFloat())
-    }
-    var translationLanguage by remember { mutableStateOf(initialPrefs.translationLanguage) }
-    var translationStyle by remember { mutableStateOf(initialPrefs.translationStyle) }
-    var glossaryDedupeInterval by remember {
-        mutableStateOf(initialPrefs.glossaryDedupeInterval.toFloat())
-    }
-    var glossaryMaxSize by remember {
-        mutableStateOf(initialPrefs.glossaryMaxSize.toFloat())
-    }
-    var translationBatchChars by remember {
-        mutableStateOf(initialPrefs.translationBatchChars.toFloat())
-    }
-    var pixivCookie by remember { mutableStateOf(initialPrefs.pixivPhpSessId) }
-    var hamelnCookie by remember { mutableStateOf(initialPrefs.hamelnCookie) }
-    var capturedHamelnUserAgent by remember { mutableStateOf(initialPrefs.hamelnUserAgent) }
-    var scribblehubCookie by remember { mutableStateOf(initialPrefs.scribblehubCookie) }
-    var capturedScribblehubUserAgent by remember { mutableStateOf(initialPrefs.scribblehubUserAgent) }
-    var ao3Cookie by remember { mutableStateOf(initialPrefs.ao3Cookie) }
-    var capturedAo3UserAgent by remember { mutableStateOf(initialPrefs.ao3UserAgent) }
-    var appTheme by remember { mutableStateOf(initialPrefs.appTheme) }
-    var readerFontFamily by remember { mutableStateOf(initialPrefs.readerFontFamily) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(onClick = {
-                onSave(
-                    LlmSettings(baseUrl, apiKey, model),
-                    initialPrefs.copy(
-                        webPrefetchAhead = prefetchAhead.toInt(),
-                        translationLanguage = translationLanguage.ifBlank {
-                            ReaderPreferences.DEFAULT_TRANSLATION_LANGUAGE
-                        },
-                        translationStyle = translationStyle,
-                        glossaryDedupeInterval = glossaryDedupeInterval.toInt(),
-                        glossaryMaxSize = glossaryMaxSize.toInt(),
-                        translationBatchChars = translationBatchChars.toInt(),
-                        pixivPhpSessId = pixivCookie.trim(),
-                        hamelnCookie = hamelnCookie.trim(),
-                        hamelnUserAgent = capturedHamelnUserAgent.trim(),
-                        scribblehubCookie = scribblehubCookie.trim(),
-                        scribblehubUserAgent = capturedScribblehubUserAgent.trim(),
-                        ao3Cookie = ao3Cookie.trim(),
-                        ao3UserAgent = capturedAo3UserAgent.trim(),
-                        appTheme = appTheme,
-                        readerFontFamily = readerFontFamily,
-                    ),
-                )
-            }) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-        title = { Text("设置") },
-        text = {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-            ) {
-                Text("LLM 配置", style = MaterialTheme.typography.titleSmall)
-                OutlinedTextField(
-                    value = baseUrl,
-                    onValueChange = { baseUrl = it },
-                    label = { Text("Base URL") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                )
-                OutlinedTextField(
-                    value = apiKey,
-                    onValueChange = { apiKey = it },
-                    label = { Text("API Key") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                )
-                ExposedDropdownMenuBox(
-                    expanded = modelDropdownExpanded,
-                    onExpandedChange = {
-                        if (modelList.isNotEmpty()) modelDropdownExpanded = it
-                    },
-                ) {
-                    OutlinedTextField(
-                        value = model,
-                        onValueChange = { model = it },
-                        label = { Text("Model") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .menuAnchor(),
-                        singleLine = true,
-                        trailingIcon = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (modelList.isNotEmpty()) {
-                                    ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelDropdownExpanded)
-                                }
-                                IconButton(
-                                    onClick = {
-                                        modelLoading = true
-                                        modelError = null
-                                        onFetchModels(LlmSettings(baseUrl, apiKey, model)) { result ->
-                                            modelLoading = false
-                                            result.onSuccess { list ->
-                                                modelList = list
-                                                modelDropdownExpanded = list.isNotEmpty()
-                                            }.onFailure { err ->
-                                                modelError = err.message
-                                            }
-                                        }
-                                    },
-                                    enabled = !modelLoading && apiKey.isNotBlank(),
-                                ) {
-                                    if (modelLoading) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(20.dp),
-                                            strokeWidth = 2.dp,
-                                        )
-                                    } else {
-                                        Icon(Icons.Default.CloudDownload, contentDescription = "获取模型列表")
-                                    }
-                                }
-                            }
-                        },
-                    )
-                    ExposedDropdownMenu(
-                        expanded = modelDropdownExpanded,
-                        onDismissRequest = { modelDropdownExpanded = false },
-                    ) {
-                        modelList.forEach { m ->
-                            DropdownMenuItem(
-                                text = {
-                                    Text(
-                                        m,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        fontFamily = FontFamily.Monospace,
-                                    )
-                                },
-                                onClick = {
-                                    model = m
-                                    modelDropdownExpanded = false
-                                },
-                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                            )
-                        }
-                    }
-                }
-                if (modelError != null) {
-                    Text(
-                        modelError!!,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                Text(
-                    "智谱 GLM 默认 baseUrl: https://open.bigmodel.cn/api/paas/v4\n" +
-                        "OpenAI 兼容: https://api.openai.com/v1",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                HorizontalDivider()
-                Text("外观", style = MaterialTheme.typography.titleSmall)
-                Text("日间 / 夜间", style = MaterialTheme.typography.bodyMedium)
-                androidx.compose.foundation.layout.Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    val options = listOf(
-                        com.zzy.llmreader.data.AppTheme.SYSTEM to "跟随系统",
-                        com.zzy.llmreader.data.AppTheme.LIGHT to "白天",
-                        com.zzy.llmreader.data.AppTheme.DARK to "夜间",
-                    )
-                    options.forEach { (value, label) ->
-                        androidx.compose.material3.FilterChip(
-                            selected = appTheme == value,
-                            onClick = { appTheme = value },
-                            label = { Text(label) },
-                        )
-                    }
-                }
-                Text(
-                    "夜间会把整个 App（书库、发现页、设置）切到深色背景。阅读区内还可以单独循环切换 白天/护眼/夜间。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text("阅读字体", style = MaterialTheme.typography.bodyMedium)
-                @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
-                androidx.compose.foundation.layout.FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    com.zzy.llmreader.data.ReaderFontFamily.entries.forEach { ff ->
-                        androidx.compose.material3.FilterChip(
-                            selected = readerFontFamily == ff,
-                            onClick = { readerFontFamily = ff },
-                            label = {
-                                Text(
-                                    ff.displayName,
-                                    fontFamily = com.zzy.llmreader.ui.theme.resolveFontFamily(ff),
-                                )
-                            },
-                        )
-                    }
-                }
-                Text(
-                    "字体仅影响正文与界面文字渲染。等宽字体适合代码/日文混排预览，衬线字体阅读更书卷气。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                HorizontalDivider()
-                Text("网页小说", style = MaterialTheme.typography.titleSmall)
-                Text(
-                    "预取章节数：${prefetchAhead.toInt()} 章" +
-                        if (prefetchAhead.toInt() == 0) "（关闭）" else "",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Slider(
-                    value = prefetchAhead,
-                    onValueChange = { prefetchAhead = it },
-                    valueRange = 0f..ReaderPreferences.MAX_PREFETCH_AHEAD.toFloat(),
-                    steps = ReaderPreferences.MAX_PREFETCH_AHEAD - 1,
-                )
-                Text(
-                    "翻到一章后会在后台静默下载接下来的 N 章；设为 0 关闭预取。" +
-                        "数字越大越流畅，但会占用流量和存储。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedTextField(
-                    value = translationLanguage,
-                    onValueChange = { translationLanguage = it },
-                    label = { Text("翻译目标语言") },
-                    placeholder = { Text("例如：简体中文 / English / 日本語") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                )
-                OutlinedTextField(
-                    value = translationStyle,
-                    onValueChange = { translationStyle = it },
-                    label = { Text("翻译风格说明（可选）") },
-                    placeholder = { Text("例如：口语化 / 轻小说风格 / 正式文学 / 保留敬语") },
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 2,
-                    maxLines = 4,
-                )
-                Text(
-                    "术语表智能去重间隔：${glossaryDedupeInterval.toInt()} 批" +
-                        if (glossaryDedupeInterval.toInt() == 0) "（关闭）" else "",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Slider(
-                    value = glossaryDedupeInterval,
-                    onValueChange = { glossaryDedupeInterval = it },
-                    valueRange = 0f..20f,
-                    steps = 19,
-                )
-                Text(
-                    "每翻译 N 批后用 LLM 对术语表做一次智能去重（合并简称/异写/统一译名）。" +
-                        "设为 0 关闭。推荐 5。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    "术语表容量上限：${glossaryMaxSize.toInt()} 条",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Slider(
-                    value = glossaryMaxSize,
-                    onValueChange = { glossaryMaxSize = it },
-                    valueRange = 20f..200f,
-                    steps = 17,
-                )
-                Text(
-                    "超过上限时自动淘汰最久未命中的条目（LRU）。" +
-                        "长篇小说人物多可调大，短篇可调小。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    "翻译分批大小：${translationBatchChars.toInt()} 字符 / 批",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Slider(
-                    value = translationBatchChars,
-                    onValueChange = { translationBatchChars = it },
-                    valueRange = ReaderPreferences.MIN_TRANSLATION_BATCH_CHARS.toFloat()
-                        ..ReaderPreferences.MAX_TRANSLATION_BATCH_CHARS.toFloat(),
-                    steps = 22, // 每 500 一档：500..12000 共 24 个位置
-                )
-                Text(
-                    "每次发给 LLM 的最大字符数。越大请求次数越少（更便宜/上下文更连贯），" +
-                        "但模型输出 token 上限一旦被压缩，末尾段落会被截断。\n" +
-                        "调用 GPT-4o / Claude / Gemini-2.5-pro 类输出不限的模型可到8000+；" +
-                        "DeepSeek / GLM-Flash / Qwen-Turbo 类低成本模型建议 3000–4000。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                HorizontalDivider()
-                Text("Pixiv 登录", style = MaterialTheme.typography.titleSmall)
-                val pixivCtx = LocalContext.current
-                OutlinedTextField(
-                    value = pixivCookie,
-                    onValueChange = { pixivCookie = it.trim() },
-                    label = { Text("PHPSESSID") },
-                    singleLine = true,
-                    placeholder = { Text("123456_AbCdEfG...") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                val pixivLoginLauncher = rememberLauncherForActivityResult(
-                    com.zzy.llmreader.web.CloudflareChallengeActivity.Contract(),
-                ) { result ->
-                    if (result != null) {
-                        // 从 cookie 串里抽 PHPSESSID=xxx
-                        val phpSessId = Regex("PHPSESSID=([^;\\s]+)").find(result.cookie)
-                            ?.groupValues?.getOrNull(1)
-                            ?.trim()
-                            .orEmpty()
-                        if (phpSessId.isNotBlank()) {
-                            pixivCookie = phpSessId
-                            android.widget.Toast.makeText(
-                                pixivCtx,
-                                "已拿到 PHPSESSID（${phpSessId.length} 字符）",
-                                android.widget.Toast.LENGTH_SHORT,
-                            ).show()
-                        } else {
-                            android.widget.Toast.makeText(
-                                pixivCtx,
-                                "返回的 cookie 里找不到 PHPSESSID，请确认已成功登录",
-                                android.widget.Toast.LENGTH_LONG,
-                            ).show()
-                        }
-                    }
-                }
-                TextButton(onClick = {
-                    pixivLoginLauncher.launch(
-                        com.zzy.llmreader.web.CloudflareChallengeActivity.Input(
-                            url = "https://accounts.pixiv.net/login?return_to=https%3A%2F%2Fwww.pixiv.net%2F",
-                            userAgent = "",
-                            targetCookieName = "PHPSESSID",
-                            titleHint = "请登录 Pixiv 账号；登录成功后会自动返回 PHPSESSID。\n如果之前登录过，可以直接打开任意 pixiv 页面后点底部「完成」。",
-                        ),
-                    )
-                }) { Text("网页登录获取 PHPSESSID") }
-                Text(
-                    "用于抓取 Pixiv 小说（支持全年龄；填了 PHPSESSID 才能拉取 R-18 / 多页 / 系列）。\n" +
-                        "推荐方式：点上面按钮在内嵌网页登录 pixiv 账号，会自动抓回 PHPSESSID。\n" +
-                        "也可以手动：电脑浏览器登录 pixiv.net → F12 → Application → Cookies → 复制 PHPSESSID。\n" +
-                        "Cookie 仅保存在本机，不会上传给 LLM 服务。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                HorizontalDivider()
-                Text("Hameln (syosetu.org) Cookie", style = MaterialTheme.typography.titleSmall)
-                OutlinedTextField(
-                    value = hamelnCookie,
-                    onValueChange = { hamelnCookie = it.trim() },
-                    label = { Text("可选 cookie串") },
-                    singleLine = true,
-                    placeholder = { Text("cf_clearance=...; over18=off") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                val ctx = LocalContext.current
-                val cfLauncher = rememberLauncherForActivityResult(
-                    com.zzy.llmreader.web.CloudflareChallengeActivity.Contract(),
-                ) { result ->
-                    if (result != null) {
-                        hamelnCookie = result.cookie
-                        capturedHamelnUserAgent = result.userAgent
-                        // 立即持久化一份，免得用户以为点了没反应。
-                        onCloudflareCookieCaptured(result.cookie, result.userAgent)
-                        android.widget.Toast.makeText(
-                            ctx,
-                            "已拿到 cf_clearance（${result.cookie.length} 字符）",
-                            android.widget.Toast.LENGTH_SHORT,
-                        ).show()
-                    } else {
-                        android.widget.Toast.makeText(
-                            ctx,
-                            "未拿到 cf_clearance，请手动完成验证后重试",
-                            android.widget.Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                }
-                TextButton(onClick = {
-                    cfLauncher.launch(
-                        com.zzy.llmreader.web.CloudflareChallengeActivity.Input(
-                            url = "https://syosetu.org/novel/410483/",
-                            // 留空 → 用 WebView 自带的真实 Chrome UA，更易过 CF。
-                            userAgent = "",
-                        ),
-                    )
-                }) { Text("自动通过 Cloudflare 验证") }
-                Text(
-                    "点上面按钮会用 WebView 打开 Hameln，过完 Cloudflare（必要时点验证码）后" +
-                        "自动把 cf_clearance 和 UA 抓回来填到这里。\n" +
-                        "如果你想手动粘贴：浏览器 → F12 → Application → Cookies → 复制整串。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                HorizontalDivider()
-                Text("ScribbleHub Cookie", style = MaterialTheme.typography.titleSmall)
-                OutlinedTextField(
-                    value = scribblehubCookie,
-                    onValueChange = { scribblehubCookie = it.trim() },
-                    label = { Text("可选 cookie串") },
-                    singleLine = true,
-                    placeholder = { Text("cf_clearance=...; ...") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                val shCfLauncher = rememberLauncherForActivityResult(
-                    com.zzy.llmreader.web.CloudflareChallengeActivity.Contract(),
-                ) { result ->
-                    if (result != null) {
-                        scribblehubCookie = result.cookie
-                        capturedScribblehubUserAgent = result.userAgent
-                        // 立即持久化一份。
-                        onScribblehubCookieCaptured(result.cookie, result.userAgent)
-                        android.widget.Toast.makeText(
-                            ctx,
-                            "已拿到 ScribbleHub cookie（${result.cookie.length} 字符）",
-                            android.widget.Toast.LENGTH_SHORT,
-                        ).show()
-                    } else {
-                        android.widget.Toast.makeText(
-                            ctx,
-                            "未拿到 cf_clearance，请手动完成验证后重试",
-                            android.widget.Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                }
-                TextButton(onClick = {
-                    shCfLauncher.launch(
-                        com.zzy.llmreader.web.CloudflareChallengeActivity.Input(
-                            url = "https://www.scribblehub.com/",
-                            userAgent = "",
-                        ),
-                    )
-                }) { Text("自动通过 ScribbleHub Cloudflare 验证") }
-                Text(
-                    "ScribbleHub 也挂在 Cloudflare 后面；点按钮在内嵌 WebView 完成验证后" +
-                        "会自动抓回 cf_clearance 和 UA。\n" +
-                        "示例：${com.zzy.llmreader.web.ScribbleHubSource().sampleUrl}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                HorizontalDivider()
-                Text("AO3 Cookie", style = MaterialTheme.typography.titleSmall)
-                OutlinedTextField(
-                    value = ao3Cookie,
-                    onValueChange = { ao3Cookie = it.trim() },
-                    label = { Text("可选 cookie串") },
-                    singleLine = true,
-                    placeholder = { Text("cf_clearance=...; ...") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                val ao3CfLauncher = rememberLauncherForActivityResult(
-                    com.zzy.llmreader.web.CloudflareChallengeActivity.Contract(),
-                ) { result ->
-                    if (result != null) {
-                        ao3Cookie = result.cookie
-                        capturedAo3UserAgent = result.userAgent
-                        onAo3CookieCaptured(result.cookie, result.userAgent)
-                        android.widget.Toast.makeText(
-                            ctx,
-                            "已拿到 AO3 cookie（${result.cookie.length} 字符）",
-                            android.widget.Toast.LENGTH_SHORT,
-                        ).show()
-                    } else {
-                        android.widget.Toast.makeText(
-                            ctx,
-                            "未拿到 cf_clearance，请手动完成验证后重试",
-                            android.widget.Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                }
-                TextButton(onClick = {
-                    ao3CfLauncher.launch(
-                        com.zzy.llmreader.web.CloudflareChallengeActivity.Input(
-                            url = "https://archiveofourown.org/",
-                            userAgent = "",
-                        ),
-                    )
-                }) { Text("自动通过 AO3 Cloudflare 验证") }
-                Text(
-                    "AO3 偶尔会用 Cloudflare 限流（HTTP 503/525）。点按钮在内嵌 WebView 中" +
-                        "完成验证后会自动抓回 cf_clearance 和 UA，并自动重试上次失败的章节。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    "阅读时点顶栏「译」按钮可在 原文 / 译文 / 双语 三种模式之间切换；" +
-                        "翻译会调用上面配置的 LLM，结果按章缓存，避免重复消耗。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        },
-    )
-}
 
 @Composable
 private fun GlossaryDialog(
