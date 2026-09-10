@@ -10,10 +10,14 @@ captures/
 *.apk
 *.aab
 
-# ---- 签名与本地配置（绝对不要提交）----
+# ---- 签名与本地配置 ----
 *.keystore
 *.jks
 !debug.keystore
+# ⚠️ 唯一的例外：release 签名写死提交进仓库（前提：仓库必须私有）。
+#    详见 keystore.properties 顶部的说明。
+!keystore/release.keystore
+!keystore.properties
 *.keystore.base64
 local.properties
 .claude/settings.local.json

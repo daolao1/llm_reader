@@ -1,9 +1,25 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
 }
+
+/**
+ * Release 签名写死在仓库根目录的 keystore.properties
+ * （keystore 文件为 keystore/release.keystore），本地和 CI 都能直接
+ * `./gradlew :app:assembleRelease` 出签名包，不需要任何额外配置。
+ *
+ * ⚠️ 前提是仓库保持**私有**，详见 keystore.properties 顶部说明。
+ * 文件缺失时自动回退 debug 签名，保证别人 clone 下来也能构建。
+ */
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val releaseStorePath: String? = keystoreProps.getProperty("storeFile")?.takeIf { it.isNotBlank() }
 
 android {
     namespace = "com.zzy.llmreader"
@@ -21,15 +37,13 @@ android {
     }
 
     signingConfigs {
-        // 只在提供了 -PRELEASE_STORE_FILE 时创建发布签名（CI 用 GitHub Secrets 注入）。
-        // 本地构建没有这些属性，会走下面的 debug 签名兜底。
+        // 读 keystore.properties；文件不存在时留空，release 回退到 debug 签名。
         create("release") {
-            val storePath = findProperty("RELEASE_STORE_FILE") as String?
-            if (!storePath.isNullOrBlank()) {
-                storeFile = file(storePath)
-                storePassword = findProperty("RELEASE_STORE_PASSWORD") as String?
-                keyAlias = findProperty("RELEASE_KEY_ALIAS") as String?
-                keyPassword = findProperty("RELEASE_KEY_PASSWORD") as String?
+            if (releaseStorePath != null) {
+                storeFile = rootProject.file(releaseStorePath)
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
             }
         }
     }
@@ -48,7 +62,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = if (!(findProperty("RELEASE_STORE_FILE") as String?).isNullOrBlank()) {
+            signingConfig = if (releaseStorePath != null) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")

@@ -201,23 +201,44 @@ Gradle 会自动解析/下载匹配的 JDK 工具链，不再依赖硬编码的 
 
 **触发**：推送 `v*` tag，或在 Actions 页面手动 `workflow_dispatch`（可指定版本号）。
 
-**需要配置的仓库 Secrets**：
+### 7.1 签名（写死在仓库里）
 
-| Secret | 说明 |
-|---|---|
-| `RELEASE_KEYSTORE_BASE64` | 签名 keystore 的 base64（`base64 -w 0 release.keystore`） |
-| `RELEASE_STORE_PASSWORD` | keystore 密码 |
-| `RELEASE_KEY_ALIAS` | key alias |
-| `RELEASE_KEY_PASSWORD` | key 密码 |
+Release 签名**不使用 GitHub Secrets**，而是直接写死在仓库根目录：
 
-未配置这四个 Secret 时**不会失败**：会给出警告并回退到 debug 签名
-（可安装，但不能上架 Google Play）。
+```
+keystore/release.keystore     签名密钥（PKCS12）
+keystore.properties           密码 / alias / 路径，由 app/build.gradle.kts 读取
+```
 
-**执行流程**：
+`app/build.gradle.kts` 启动时读 `keystore.properties`，有配置就用它签 release；
+**文件缺失时自动回退 debug 签名** —— 这样别人 clone 下来照样能构建，CI 也不需要任何额外配置。
+
+> ⚠️ **仓库必须保持私有。**
+> 签名私钥在版本控制里，一旦仓库公开，任何人都能拿到这把 key，签出与你 App
+> 同包名、同签名的 APK，安卓会把它当作合法更新安装。
+>
+> **轮换密钥**：删掉 `keystore/` 与 `keystore.properties` → 用 `keytool -genkeypair`
+> 重新生成 → 更新 `keystore.properties`。代价是已安装的 App 因签名不同无法覆盖升级，
+> 用户必须卸载重装。
+
+CI 里还有一道保险：`Verify the APK is signed with the release key` 步骤用
+`apksigner --print-certs` 检查产物，发现是 `CN=Android Debug` 就**直接让构建失败**，
+避免签名静默失效却照常发布。
+
+本地验证签名是否生效：
+
+```bash
+./gradlew :app:assembleRelease
+"$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs \
+  app/build/outputs/apk/release/app-release.apk
+# 期望 DN: CN=LLM Reader, OU=Personal, O=daolao1, C=CN
+```
+
+### 7.2 执行流程
 
 ```
 prepare   ── 从 tag/输入解析 versionName + versionCode(=major*10000+minor*100+patch)
-   ├── android (ubuntu)    :app:assembleRelease → android-apk
+   ├── android (ubuntu)    :app:assembleRelease → apksigner 验签 → android-apk
    ├── desktop (matrix)    ubuntu→.deb / windows→.msi / macos→.dmg
    └── release (ubuntu)    download-artifact + softprops/action-gh-release
                            自动生成 release notes，预发布版按 `-` 后缀判定
@@ -229,5 +250,8 @@ prepare   ── 从 tag/输入解析 versionName + versionCode(=major*10000+min
 ./gradlew :app:assembleRelease -PversionName=1.2.3 -PversionCode=10203
 ```
 
-> 注意：只要 `desktop` 矩阵里**任意一个** OS 打包失败，`release` 任务就不会执行
+> 注意 1：只要 `desktop` 矩阵里**任意一个** OS 打包失败，`release` 任务就不会执行
 > （`needs` 语义）。若 Windows runner 偶发失败，可先只重跑失败的 leg。
+>
+> 注意 2：私有仓库的 Actions 分钟数是**计费**的（公开仓库免费），且 macOS runner
+> 按 10 倍计费。额度紧张时可以把 `macos-latest` 从矩阵里去掉。

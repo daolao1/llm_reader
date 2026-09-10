@@ -144,9 +144,21 @@ git tag v1.0.0 && git push origin v1.0.0
 产物：签名 APK、`.deb`、`.msi`、`.dmg`。
 也可在 Actions 页面手动 `workflow_dispatch` 并指定版本号。
 
-需要配置 4 个仓库 Secret（`RELEASE_KEYSTORE_BASE64`、`RELEASE_STORE_PASSWORD`、
-`RELEASE_KEY_ALIAS`、`RELEASE_KEY_PASSWORD`）；未配置时会回退到 debug 签名并给出警告。
-详见 [docs/MULTIPLATFORM.md](docs/MULTIPLATFORM.md) 第 7 节。
+**签名已写死在仓库里**（`keystore/release.keystore` + `keystore.properties`），
+不需要配置任何 GitHub Secrets；本地 `./gradlew :app:assembleRelease` 也直接出签名包。
+
+> ⚠️ 正因如此，**本仓库必须保持私有** —— 签名私钥在版本控制里。
+> 详见 [keystore.properties](keystore.properties) 顶部说明与
+> [docs/MULTIPLATFORM.md](docs/MULTIPLATFORM.md) 第 7 节。
+
+验证签名是否生效：
+
+```bash
+./gradlew :app:assembleRelease
+"$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs \
+  app/build/outputs/apk/release/app-release.apk
+# 期望 DN: CN=LLM Reader, OU=Personal, O=daolao1, C=CN
+```
 
 ---
 
