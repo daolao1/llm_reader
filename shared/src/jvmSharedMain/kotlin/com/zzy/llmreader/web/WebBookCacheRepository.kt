@@ -3,6 +3,7 @@ package com.zzy.llmreader.web
 import com.zzy.llmreader.model.BookContent
 import com.zzy.llmreader.model.Chapter
 import com.zzy.llmreader.platform.AppDirs
+import com.zzy.llmreader.platform.writeTextAtomically
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -65,15 +66,9 @@ class WebBookCacheRepository(private val dirs: AppDirs) {
     fun readSync(url: String): CachedWebBook? = read(url)
 
     fun write(book: CachedWebBook): CachedWebBook {
-        val file = cacheFile(book.url)
-        file.parentFile?.mkdirs()
-        val tmp = File(file.parentFile, "${file.name}.tmp")
-        tmp.writeText(json.encodeToString(book), Charsets.UTF_8)
-        if (file.exists()) file.delete()
-        if (!tmp.renameTo(file)) {
-            file.writeText(tmp.readText(Charsets.UTF_8), Charsets.UTF_8)
-            tmp.delete()
-        }
+        // 原子写：这里存的是整本书的章节正文 + LLM 译文 + 术语表，
+        // 「先 delete 再 rename」会留出文件不存在的窗口，进程被杀就全丢。
+        writeTextAtomically(cacheFile(book.url), json.encodeToString(book))
         return book
     }
 

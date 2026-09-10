@@ -50,12 +50,35 @@ class ImageCache(private val dirs: AppDirs) {
     private fun indexFile(bookId: String, chapterIndex: Int): File =
         File(chapterDir(bookId, chapterIndex), "index.json")
 
+    /**
+     * 读章节索引。
+     *
+     * 索引损坏时**不能**静默返回空列表：`save()` 会拿 `list()` 的结果做
+     * `current + entry` 再整体覆盖，于是一份坏索引会让此前生成的所有图片
+     * 从索引里永久消失（PNG 还在磁盘上，但 list / delete / findByPrompt
+     * 都看不到，prompt 缓存也失效、重复生成要再次付费）。
+     *
+     * 这里把坏文件改名留档，并打日志，让问题可见、内容可人工捞回。
+     */
+    private fun readIndex(f: File): List<GeneratedImage> {
+        if (!f.exists()) return emptyList()
+        val raw = runCatching { f.readText() }.getOrNull() ?: return emptyList()
+        return runCatching {
+            json.decodeFromString(ChapterIndex.serializer(), raw).images
+        }.getOrElse { err ->
+            val kept = File(f.parentFile, "${f.name}.corrupt-${System.currentTimeMillis()}")
+            runCatching { f.renameTo(kept) }
+            com.zzy.llmreader.platform.PlatformLog.e(
+                "ImageCache",
+                "章节索引损坏，已留档到 ${kept.name}（图片文件仍在，可人工恢复）：${err.message}",
+            )
+            emptyList()
+        }
+    }
+
     suspend fun list(bookId: String, chapterIndex: Int): List<GeneratedImage> =
         withContext(Dispatchers.IO) {
-            val f = indexFile(bookId, chapterIndex)
-            if (!f.exists()) return@withContext emptyList()
-            runCatching { json.decodeFromString(ChapterIndex.serializer(), f.readText()).images }
-                .getOrDefault(emptyList())
+            readIndex(indexFile(bookId, chapterIndex))
         }
 
     suspend fun save(
@@ -85,7 +108,10 @@ class ImageCache(private val dirs: AppDirs) {
         )
         val current = list(bookId, chapterIndex)
         val updated = ChapterIndex(images = current + entry)
-        indexFile(bookId, chapterIndex).writeText(json.encodeToString(ChapterIndex.serializer(), updated))
+        com.zzy.llmreader.platform.writeTextAtomically(
+            indexFile(bookId, chapterIndex),
+            json.encodeToString(ChapterIndex.serializer(), updated),
+        )
         entry
     }
 
@@ -95,8 +121,10 @@ class ImageCache(private val dirs: AppDirs) {
             val match = current.find { it.id == id } ?: return@withContext
             File(chapterDir(bookId, chapterIndex), match.filename).delete()
             val updated = ChapterIndex(images = current.filter { it.id != id })
-            indexFile(bookId, chapterIndex)
-                .writeText(json.encodeToString(ChapterIndex.serializer(), updated))
+            com.zzy.llmreader.platform.writeTextAtomically(
+                indexFile(bookId, chapterIndex),
+                json.encodeToString(ChapterIndex.serializer(), updated),
+            )
         }
 
     fun fileFor(bookId: String, chapterIndex: Int, filename: String): File =

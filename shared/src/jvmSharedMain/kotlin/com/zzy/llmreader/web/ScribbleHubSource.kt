@@ -70,12 +70,31 @@ class ScribbleHubSource(
         }.maxOrNull() ?: 1
 
         if (totalPages > 1) {
+            // 旧实现对失败页 `?: continue` 直接跳过：第 2 页挂了就会静默得到
+            // 「1,3,4,5…」这样残缺的目录，而且这份残缺目录会被写进缓存，
+            // 已保存的阅读进度（按章节下标）随之错位。这里改为记录失败页，
+            // 全部失败就直接报错，部分失败则在目录末尾追加提示。
+            val failedPages = mutableListOf<Int>()
             for (page in 2..totalPages) {
                 onProgress(0, totalPages, "读取目录第 $page / $totalPages 页…")
                 val pageDoc = runCatching {
                     fetchDocument("$canonicalUrl?pg=$page")
-                }.getOrNull() ?: continue
+                }.getOrNull()
+                if (pageDoc == null) {
+                    failedPages += page
+                    continue
+                }
                 addChapters(pageDoc, collected)
+            }
+            // 有失败页就直接报错，**不缓存残缺目录**。
+            // 残缺目录一旦落盘，阅读进度（按章节下标保存）就会永久错位，
+            // 而且用户看不出少了章节。fetchDocument 内部已经重试过 8 次，
+            // 到这里还失败基本是真故障（被 CF 拦、或页面 404）。
+            if (failedPages.isNotEmpty()) {
+                error(
+                    "目录第 ${failedPages.joinToString("、")} 页读取失败（共 $totalPages 页），" +
+                        "为避免缓存残缺目录已中止。请稍后重试。",
+                )
             }
         }
 

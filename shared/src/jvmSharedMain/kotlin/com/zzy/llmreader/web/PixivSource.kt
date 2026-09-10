@@ -79,7 +79,14 @@ class PixivSource(
         // 单篇 URL：先拉一次正文，看是不是系列里的一篇，是的话再升级成系列目录。
         val novelId = canonicalUrl.substringAfter("?id=").substringBefore("&")
         val body = fetchNovelBody(novelId)
-        val seriesId = body["seriesId"]?.jsonPrimOrNull()?.contentOrNull
+        // ⚠️ seriesId 不在顶层，而在 body.seriesNavData.seriesId。
+        // 旧实现读 `body["seriesId"]` 永远拿到 null，于是「单篇自动升级成系列」
+        // 这段是死代码 —— 粘贴一个属于 30+ 话系列的作品，只会得到 1 章的书，
+        // 没有任何入口能读到其余话。
+        val seriesId = body["seriesNavData"]
+            ?.let { it as? kotlinx.serialization.json.JsonObject }
+            ?.get("seriesId")
+            ?.jsonPrimOrNull()?.contentOrNull
             ?.takeIf { it.isNotBlank() && it != "0" }
         if (seriesId != null) {
             // 升级到系列模式

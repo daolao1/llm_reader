@@ -80,11 +80,7 @@ class LiteroticaSource : HtmlWebSource() {
                 ?.ifBlank { null }
             ?: doc.title().ifBlank { null }
             ?: "Literotica 小说"
-        return title
-            .removeSuffix(" - Literotica.com")
-            .substringBeforeLast(" - ", title)
-            .trim()
-            .ifBlank { "Literotica 小说" }
+        return cleanLiteroticaTitle(title)
     }
 
     private fun discoverPageCount(doc: Document, canonicalUrl: HttpUrl): Int {
@@ -378,3 +374,31 @@ internal class LiteroticaDiscovery(private val source: LiteroticaSource) : WebDi
         )
     }
 }
+
+/**
+ * 清洗 Literotica 的标题。
+ *
+ * 旧实现是 `substringBeforeLast(" - ", title)` —— 一刀切掉最后一个破折号之后的内容，
+ * 把标题里合法的破折号也毁了。真实样本（literotica.com/api/3/search/stories
+ * 抓 100 条）里有 7 条中招：
+ *
+ *   "5 - Mommy Holding My Cock While I Pee"  →  变成「5」
+ *   "Adventures of a Girlbuck - Ch. 01"      →  丢掉章节号
+ *   "White Slave Rebecca - Rage"             →  变成「White Slave Rebecca」
+ *
+ * 现在只在这种后缀**确实像章节标记**时才去掉。
+ * 抽成 internal 顶层函数是为了能直接单测（见 LiteroticaTitleTest）。
+ */
+internal fun cleanLiteroticaTitle(raw: String): String =
+    raw
+        .removeSuffix(" - Literotica.com")
+        .replace(CHAPTER_SUFFIX, "")
+        .trim()
+        .ifBlank { "Literotica 小说" }
+
+/** 只匹配「 - Ch. 12」「 - Part 3」「 - 第5章」「 - 2」这类真正的章节后缀。 */
+private val CHAPTER_SUFFIX = Regex(
+    """\s+-\s*(ch(?:apter)?\.?\s*\d+|part\s*\d+|ep(?:isode)?\.?\s*\d+|""" +
+        """第\s*[0-9一二三四五六七八九十百千]+\s*[章节話话回]|\d+)\s*$""",
+    RegexOption.IGNORE_CASE,
+)

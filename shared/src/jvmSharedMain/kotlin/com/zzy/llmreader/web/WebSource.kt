@@ -145,13 +145,22 @@ abstract class HtmlWebSource : WebSource {
                     return@withContext body to r.request.url.toString()
                 }
                 lastError = "HTTP ${r.code}"
-                // CF 挑战页：靠重试不会自动好，立刻抛出让 UI 引导用户走 WebView 拿 cookie。
-                if (r.code in CLOUDFLARE_STATUS && looksLikeCloudflare(body, r.headers)) {
-                    throw CloudflareBlockedException(url, r.code)
-                }
-                // 仅对 5xx / 408 / 429 重试
                 val retriable = r.code in 500..599 || r.code == 408 || r.code == 429
-                if (!retriable || attempt >= MAX_ATTEMPTS) {
+
+                // ⚠️ 顺序很重要：**先给瞬时错误重试机会，再判断是不是 CF 挑战**。
+                //
+                // Cloudflare 的 520~527/530 属于边缘节点抖动（实测同一 URL 连续请求
+                // 会出现 525 → 525 → 200），全都在 500..599 里、本该走重试。
+                // 但旧实现把 CF 判断放在了重试判断**前面**，这些码一进来就抛
+                // CloudflareBlockedException，8 次重试形同虚设；更糟的是
+                // CF 前置站点（AO3 / ScribbleHub）连正常响应都带 cf-ray 头，
+                // 于是任何 5xx 都会被弹去走一个根本过不了的验证页。
+                if (retriable && attempt < MAX_ATTEMPTS) {
+                    // 交给循环末尾的退避重试
+                } else if (r.code in CLOUDFLARE_STATUS && looksLikeCloudflare(body, r.headers)) {
+                    // 重试耗尽后仍然像是挑战页，才让 UI 引导用户走 WebView 拿 cookie
+                    throw CloudflareBlockedException(url, r.code)
+                } else {
                     error("网页请求失败：HTTP ${r.code}")
                 }
             }
@@ -162,11 +171,20 @@ abstract class HtmlWebSource : WebSource {
         error("网页请求失败（已重试 $MAX_ATTEMPTS 次）：$lastError")
     }
 
+    /**
+     * 判断响应是不是 Cloudflare 的**挑战/拦截页**。
+     *
+     * ⚠️ 只认真正的挑战信号。
+     * 旧实现把「`Server: cloudflare`」和「存在任意 `cf-*` 响应头」也算作挑战 ——
+     * 但 AO3 / ScribbleHub 这类 CF 前置站点的**正常 200 响应**同样带 `cf-ray`，
+     * 于是任何 403/503 都会被误判成挑战，把用户送去过一个永远过不了的验证页。
+     */
     private fun looksLikeCloudflare(body: String, headers: okhttp3.Headers): Boolean {
-        if (headers.values("server").any { it.contains("cloudflare", ignoreCase = true) }) return true
-        if (headers.names().any { it.lowercase().startsWith("cf-") }) return true
         if (body.contains("Just a moment", ignoreCase = true)) return true
         if (body.contains("challenges.cloudflare.com", ignoreCase = true)) return true
+        if (body.contains("cf-challenge", ignoreCase = true)) return true
+        // CF 在托管挑战/拦截时会显式加这个头
+        if (headers["cf-mitigated"]?.isNotBlank() == true) return true
         return false
     }
 
