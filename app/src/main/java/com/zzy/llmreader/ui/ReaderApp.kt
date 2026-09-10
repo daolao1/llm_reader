@@ -141,6 +141,9 @@ fun ReaderApp(
     var chromeVisible by remember { mutableStateOf(true) }
     // Toast 用来把「保存时被忽略的条目」这类信息明确告诉用户，而不是静默丢弃
     val ctx = androidx.compose.ui.platform.LocalContext.current
+    // 书库列表的滚动位置：放在这一层才能在「打开书 → 返回书库」之间保住，
+    // 放在 LibraryScreen 里 remember 的话，开书时整个屏幕离开组合、位置就丢了。
+    val libraryListState = androidx.compose.foundation.lazy.rememberLazyListState()
     val snackbarHost = remember { SnackbarHostState() }
 
     // CF 拦截后自动弹验证 Activity；拿到 cookie 后 ViewModel 自动重试。
@@ -385,6 +388,7 @@ fun ReaderApp(
                 onShowDetail = viewModel::openBookDetailFromRecent,
                 llmConfigured = state.settings.apiKey.isNotBlank(),
                 onOpenSettings = { showSettings = true },
+                listState = libraryListState,
             )
             else -> ReaderThemeOverride(
                 state.readerPrefs.readingTheme,
@@ -684,7 +688,14 @@ private fun LibraryScreen(
     onShowDetail: (RecentBook) -> Unit = {},
     llmConfigured: Boolean = true,
     onOpenSettings: () -> Unit = {},
+    /**
+     * 由上层持有：书库在打开一本书时会整个离开组合，
+     * 若把 LazyListState 放在这里 remember，滚动位置每次回来都会重置到顶部。
+     */
+    listState: androidx.compose.foundation.lazy.LazyListState =
+        androidx.compose.foundation.lazy.rememberLazyListState(),
 ) {
+    var pendingDelete by remember { mutableStateOf<RecentBook?>(null) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -781,6 +792,7 @@ private fun LibraryScreen(
                 )
             }
             LazyColumn(
+                state = listState,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 8.dp),
@@ -790,10 +802,41 @@ private fun LibraryScreen(
                     RecentItem(
                         book = book,
                         onClick = { onOpenRecent(book) },
-                        onDelete = { onRemoveRecent(book) },
+                        onDelete = { pendingDelete = book },
                         onShowDetail = { onShowDetail(book) },
                     )
                 }
+            }
+
+            // 删除前先确认。网页小说的「移除」会连本地缓存的全部章节和
+            // LLM 译文一起删掉（见 ReaderViewModel.removeRecent），
+            // 旧版点一下就直接删，没有任何挽回余地。
+            pendingDelete?.let { target ->
+                val isWeb = target.source == com.zzy.llmreader.data.RecentBookSource.WEB ||
+                    target.uri.startsWith("http", ignoreCase = true)
+                AlertDialog(
+                    onDismissRequest = { pendingDelete = null },
+                    title = { Text("移除《${target.title}》？") },
+                    text = {
+                        Text(
+                            if (isWeb) {
+                                "会同时删除这本书已下载的全部章节正文、LLM 译文和术语表，" +
+                                    "且无法恢复。重新打开需要重新下载和重新翻译。"
+                            } else {
+                                "只会从书库列表里移除，本地文件不受影响。"
+                            },
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            pendingDelete = null
+                            onRemoveRecent(target)
+                        }) { Text(if (isWeb) "删除缓存并移除" else "移除") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { pendingDelete = null }) { Text("取消") }
+                    },
+                )
             }
         }
     }
@@ -1198,7 +1241,11 @@ private fun AskDialog(
                 }
                 if (ask.answer.isNotBlank()) {
                     Text("回答：", style = MaterialTheme.typography.titleSmall)
-                    Text(ask.answer)
+                    // 可选中复制：旧版全项目 0 处 SelectionContainer，
+                    // 花钱让 AI 生成的总结一个字都复制不出来
+                    androidx.compose.foundation.text.selection.SelectionContainer {
+                        Text(ask.answer)
+                    }
                 }
             }
         },

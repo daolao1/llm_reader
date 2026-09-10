@@ -428,11 +428,14 @@ private fun SummaryBlock(detail: BookDetailUiState, onTagClick: (String) -> Unit
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(
-                    summary,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                )
+                // 可选中复制：简介（尤其是机器翻译过的）经常需要拿去搜原站
+                androidx.compose.foundation.text.selection.SelectionContainer {
+                    Text(
+                        summary,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    )
+                }
             }
             if (displayTags.isNotEmpty()) Spacer(Modifier.height(14.dp))
         }

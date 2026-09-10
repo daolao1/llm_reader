@@ -25,12 +25,19 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!--
+              深度链接：覆盖 WebSourceRegistry 里全部 8 个站点。
+              旧版只注册了 Literotica 和 Syosetu，从浏览器点另外 6 个站点的
+              链接不会唤起本应用。pathPrefix 与各 *Source.matches() 的判定保持一致，
+              避免把标签页/列表页这类非作品链接也拦进来。
+            -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
 
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
 
+                <!-- Literotica -->
                 <data
                     android:host="www.literotica.com"
                     android:pathPrefix="/s/"
@@ -39,19 +46,82 @@
                     android:host="literotica.com"
                     android:pathPrefix="/s/"
                     android:scheme="https" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-
+                <!-- Syosetu / Novel18 / 短編・mid -->
                 <data
                     android:host="ncode.syosetu.com"
                     android:scheme="https" />
                 <data
                     android:host="novel18.syosetu.com"
                     android:scheme="https" />
+                <data
+                    android:host="mid.syosetu.com"
+                    android:scheme="https" />
+                <!-- AO3：只认作品页 /works/ -->
+                <data
+                    android:host="archiveofourown.org"
+                    android:pathPrefix="/works/"
+                    android:scheme="https" />
+                <data
+                    android:host="www.archiveofourown.org"
+                    android:pathPrefix="/works/"
+                    android:scheme="https" />
+                <!-- Pixiv：只认小说页 -->
+                <data
+                    android:host="www.pixiv.net"
+                    android:pathPrefix="/novel/"
+                    android:scheme="https" />
+                <data
+                    android:host="pixiv.net"
+                    android:pathPrefix="/novel/"
+                    android:scheme="https" />
+                <!-- Hameln (syosetu.org)：只认 /novel/<id> -->
+                <data
+                    android:host="syosetu.org"
+                    android:pathPrefix="/novel/"
+                    android:scheme="https" />
+                <data
+                    android:host="www.syosetu.org"
+                    android:pathPrefix="/novel/"
+                    android:scheme="https" />
+                <!-- Kakuyomu：只认 /works/<id> -->
+                <data
+                    android:host="kakuyomu.jp"
+                    android:pathPrefix="/works/"
+                    android:scheme="https" />
+                <data
+                    android:host="www.kakuyomu.jp"
+                    android:pathPrefix="/works/"
+                    android:scheme="https" />
+                <!-- ScribbleHub：只认 /series/<id> -->
+                <data
+                    android:host="www.scribblehub.com"
+                    android:pathPrefix="/series/"
+                    android:scheme="https" />
+                <data
+                    android:host="scribblehub.com"
+                    android:pathPrefix="/series/"
+                    android:scheme="https" />
+                <!-- Royal Road：只认 /fiction/<id> -->
+                <data
+                    android:host="www.royalroad.com"
+                    android:pathPrefix="/fiction/"
+                    android:scheme="https" />
+                <data
+                    android:host="royalroad.com"
+                    android:pathPrefix="/fiction/"
+                    android:scheme="https" />
+            </intent-filter>
+            <!-- 从文件管理器「用其他应用打开」也能进来 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/markdown" />
+                <data android:mimeType="text/html" />
+                <data android:mimeType="application/epub+zip" />
+                <data android:mimeType="application/pdf" />
             </intent-filter>
         </activity>
 
