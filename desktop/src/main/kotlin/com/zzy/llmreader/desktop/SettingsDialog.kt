@@ -36,7 +36,13 @@ import com.zzy.llmreader.data.ReadingTheme
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.ui.text.style.TextOverflow
+import com.zzy.llmreader.data.LlmPresets
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () -> Unit) {
     // remember 带 key：设置是异步从 DataStore 到达的，
@@ -77,11 +83,77 @@ fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () ->
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 SectionTitle("大模型（OpenAI 兼容 /chat/completions）")
+
+                // 先选服务商，自动填 Base URL —— 与 Android 端一致，
+                // 不让用户手打地址（也避免把带 /chat/completions 的完整地址粘进来）
+                val currentPreset = LlmPresets.match(baseUrl)
+                var providerExpanded by remember { mutableStateOf(false) }
+                ExposedDropdownMenuBox(
+                    expanded = providerExpanded,
+                    onExpandedChange = { providerExpanded = it },
+                ) {
+                    OutlinedTextField(
+                        value = currentPreset.displayName,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("服务商") },
+                        supportingText = {
+                            val hint = currentPreset.keyHint
+                            if (hint.isNotBlank()) Text(hint)
+                        },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = providerExpanded)
+                        },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(),
+                    )
+                    ExposedDropdownMenu(
+                        expanded = providerExpanded,
+                        onDismissRequest = { providerExpanded = false },
+                    ) {
+                        LlmPresets.allWithCustom.forEach { preset ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(preset.displayName)
+                                        if (!preset.custom) {
+                                            Text(
+                                                preset.baseUrl,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    providerExpanded = false
+                                    if (preset.custom) {
+                                        if (LlmPresets.match(baseUrl) != LlmPresets.CUSTOM) baseUrl = ""
+                                    } else {
+                                        baseUrl = preset.baseUrl
+                                        val isStaleSuggestion = LlmPresets.all
+                                            .any { model in it.suggestedModels }
+                                        if (model.isBlank() || isStaleSuggestion) {
+                                            preset.suggestedModels.firstOrNull()?.let { model = it }
+                                        }
+                                        models = emptyList()
+                                        hint = null
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = baseUrl,
                     onValueChange = { baseUrl = it },
                     label = { Text("Base URL") },
-                    supportingText = { Text("例如 https://open.bigmodel.cn/api/paas/v4 或 https://api.openai.com/v1") },
+                    supportingText = { Text("填到 /v1 为止，不要带 /chat/completions（选服务商会自动填）") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )

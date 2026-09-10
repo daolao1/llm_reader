@@ -50,6 +50,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.zzy.llmreader.data.AppTheme
+import com.zzy.llmreader.data.LlmPresets
 import com.zzy.llmreader.data.LlmSettings
 import com.zzy.llmreader.data.ReaderFontFamily
 import com.zzy.llmreader.data.ReaderPreferences
@@ -221,6 +222,78 @@ fun SettingsDialog(
             ) {
                 // ================= ① 开始使用 =================
                 SectionTitle("① 开始使用", "这三项填好就能翻译了，其余都可以留空")
+
+                // 先选服务商，自动填 Base URL —— 不该要求用户手打地址。
+                // 之前 Base URL 是个空输入框，新用户不知道填什么；更常见的坑是
+                // 把文档里那条完整地址粘进来（带 /chat/completions），
+                // LlmClient 再拼一次就变成 .../chat/completions/chat/completions。
+                val currentPreset = LlmPresets.match(baseUrl)
+                var providerExpanded by remember { mutableStateOf(false) }
+                ExposedDropdownMenuBox(
+                    expanded = providerExpanded,
+                    onExpandedChange = { providerExpanded = it },
+                ) {
+                    OutlinedTextField(
+                        value = currentPreset.displayName,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("服务商") },
+                        supportingText = {
+                            val hint = currentPreset.keyHint
+                            if (hint.isNotBlank()) Text(hint)
+                        },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = providerExpanded)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(),
+                        singleLine = true,
+                    )
+                    ExposedDropdownMenu(
+                        expanded = providerExpanded,
+                        onDismissRequest = { providerExpanded = false },
+                    ) {
+                        LlmPresets.allWithCustom.forEach { preset ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(preset.displayName)
+                                        if (!preset.custom) {
+                                            Text(
+                                                preset.baseUrl,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    providerExpanded = false
+                                    if (preset.custom) {
+                                        // 自定义：清空让用户自己填（保留已填内容更友好）
+                                        if (LlmPresets.match(baseUrl) != LlmPresets.CUSTOM) baseUrl = ""
+                                    } else {
+                                        baseUrl = preset.baseUrl
+                                        // 模型栏为空、或还停在别的服务商的推荐模型上时，一并替换
+                                        val isStaleSuggestion = LlmPresets.all
+                                            .any { model in it.suggestedModels }
+                                        if (model.isBlank() || isStaleSuggestion) {
+                                            preset.suggestedModels.firstOrNull()?.let { model = it }
+                                        }
+                                        // 换了服务商，之前拉到的模型列表作废
+                                        modelList = emptyList()
+                                        modelOk = null
+                                        modelError = null
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = baseUrl,
                     onValueChange = { baseUrl = it },
@@ -230,7 +303,7 @@ fun SettingsDialog(
                     supportingText = {
                         Text(
                             baseUrlError
-                                ?: "填到 /v1 为止，例如 …/api/paas/v4 或 https://api.openai.com/v1",
+                                ?: "填到 /v1 为止，不要带 /chat/completions（选服务商会自动填）",
                         )
                     },
                     modifier = Modifier.fillMaxWidth(),
