@@ -15,6 +15,7 @@ import com.zzy.llmreader.data.RecentBookSource
 import com.zzy.llmreader.data.ReadingTheme
 import com.zzy.llmreader.data.TranslationMode
 import com.zzy.llmreader.format.AndroidBookSource
+import com.zzy.llmreader.ui.reader.refreshChapterImages
 import com.zzy.llmreader.llm.ChapterTranslator
 import com.zzy.llmreader.llm.ChatMessage
 import com.zzy.llmreader.model.BookContent
@@ -39,136 +40,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
-data class AskState(
-    val visible: Boolean = false,
-    val question: String = "",
-    val answer: String = "",
-    val loading: Boolean = false,
-    val error: String? = null,
-)
-
-data class ReaderUiState(
-    val book: BookContent? = null,
-    val currentChapter: Int = 0,
-    val fontScale: Float = 1f,
-    val loading: Boolean = false,
-    val loadingText: String = "解析中…",
-    val error: String? = null,
-    val ask: AskState = AskState(),
-    /** 当前正在加载正文的章节下标集合（懒加载用）。 */
-    val loadingChapters: Set<Int> = emptySet(),
-    /** 当前打开的网页小说的归一化 URL；非网页小说为 null。 */
-    val webCanonicalUrl: String? = null,
-    val webSourceId: String? = null,
-    val settings: LlmSettings = LlmSettings(
-        baseUrl = SettingsRepository.DEFAULT_BASE_URL,
-        apiKey = "",
-        model = SettingsRepository.DEFAULT_MODEL,
-    ),
-    val readerPrefs: ReaderPreferences = ReaderPreferences(),
-    /** 正在翻译的章节下标。 */
-    val translatingChapters: Set<Int> = emptySet(),
-    /** 当前章节翻译进度文本（如"翻译中 2/5"）；非翻译期间为 null。 */
-    val translationProgress: String? = null,
-    /** 翻译失败的章节及失败原因；UI 据此显示"重试"按钮。 */
-    val failedTranslations: Map<Int, String> = emptyMap(),
-    /** 检测到 Cloudflare 拦截，UI 弹 CF 验证 Activity 后清空。 */
-    val pendingCloudflareUrl: String? = null,
-    val imageGenSettings: com.zzy.llmreader.data.ImageGenSettings =
-        com.zzy.llmreader.data.ImageGenSettings(),
-    val characterLibrary: com.zzy.llmreader.image.CharacterLibrary =
-        com.zzy.llmreader.image.CharacterLibrary(),
-    /** 当前章节已生成的图片列表。 */
-    val chapterImages: List<com.zzy.llmreader.image.ImageCache.GeneratedImage> = emptyList(),
-    /** 是否正在生成图片。 */
-    val generatingImage: Boolean = false,
-    /** 图片生成的最近一次错误。 */
-    val imageGenError: String? = null,
-    /** 发现页（图书馆式浏览）状态。 */
-    val discovery: DiscoveryUiState = DiscoveryUiState(),
-    /** 作品详情页状态；null 表示当前未在展示详情页。 */
-    val bookDetail: BookDetailUiState? = null,
-    /** 当前章节首次显示时使用的初始滚动百分比（0..1），从持久化进度恢复。 */
-    val initialChapterScrollFraction: Float = 0f,
-)
-
-/** 发现页 UI 状态：站点 / 当前查询 / 结果 / 加载与错误。 */
-data class DiscoveryUiState(
-    /** 当前选中的站点 ID；null 表示尚未选择。 */
-    val siteId: String? = null,
-    val query: com.zzy.llmreader.web.DiscoveryQuery = com.zzy.llmreader.web.DiscoveryQuery(),
-    val items: List<com.zzy.llmreader.web.DiscoveryItem> = emptyList(),
-    val hasMore: Boolean = false,
-    val totalCount: Long? = null,
-    val loading: Boolean = false,
-    val error: String? = null,
-    /** 是否对结果做翻译（前端开关 + 触发批量翻译；UI 显示原文还是译文也由它决定）。 */
-    val translateListings: Boolean = false,
-    /** 正在翻译的 item.id 集合（批量翻译时是当前批次中的全部 id）。 */
-    val translating: Set<String> = emptySet(),
-    /** 列表滚动位置（首个可见 item 的下标 / 像素偏移），用于离开后再回到 Discovery 时恢复。 */
-    val scrollIndex: Int = 0,
-    val scrollOffset: Int = 0,
-    /** 当前打开的作品详情 item.id；null 表示未打开详情弹窗。 */
-    val detailItemId: String? = null,
-    /**
-     * 站点原生分组的相似作品（如「相似作品」+「作者同作品」）；
-     * null 表示尚未拉取，emptyList 表示已尝试但无结果。
-     */
-    val detailSimilarGroups: List<com.zzy.llmreader.web.SimilarGroup>? = null,
-    /** 正在拉取站点原生相似作品。 */
-    val detailSimilarLoading: Boolean = false,
-)
-
-/**
- * 作品详情页 UI 状态。同时支持网页小说与本地导入。
- * - 网页：[isWeb]=true，使用 [key] 作为 canonicalUrl；可拉取站点原生相似/作者作品。
- * - 本地：[isWeb]=false，使用 [key] 作为 content URI 字符串；只展示已解析的目录。
- */
-data class BookDetailUiState(
-    /** 入口标识：web 用 canonicalUrl，本地用 content URI 字符串。 */
-    val key: String,
-    val title: String,
-    val isWeb: Boolean,
-    /** WebSource.id；本地为 null。 */
-    val sourceId: String? = null,
-    /** 站点显示名（web 用，UI 友好）。 */
-    val sourceName: String? = null,
-    /** 入口 URL，用于「打开站点链接」。 */
-    val detailUrl: String? = null,
-    val translatedTitle: String? = null,
-    val author: String? = null,
-    val coverUrl: String? = null,
-    val summary: String? = null,
-    val translatedSummary: String? = null,
-    val tags: List<String> = emptyList(),
-    val translatedTags: List<String>? = null,
-    val status: String? = null,
-    val chapterCount: Int? = null,
-    val wordCount: Long? = null,
-    val updatedAt: Long? = null,
-    val metrics: Map<String, String> = emptyMap(),
-    /** 章节标题列表（cached/已解析时填充）。 */
-    val chapters: List<String> = emptyList(),
-    val translatedChapters: List<String?>? = null,
-    /** 章节目录是否已是站点最新版本（缓存命中时为 true）。 */
-    val tocFromCache: Boolean = false,
-    /** 正在加载/抓取目录。 */
-    val tocLoading: Boolean = false,
-    val tocError: String? = null,
-    /** 站点原生分组的相似作品 + 作者同作品；null 表示尚未拉取。 */
-    val similarGroups: List<com.zzy.llmreader.web.SimilarGroup>? = null,
-    val similarLoading: Boolean = false,
-    /** 是否启用译文显示（与发现页共用同一开关）。 */
-    val translateListings: Boolean = false,
-)
 
 class ReaderViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 所有仓储 / 客户端都由 shared 的组合根提供（与桌面端是同一份实现）。 */
     private val core = (app as LlmReaderApp).core
 
-    private val settingsRepo = core.settingsRepo
+    internal val settingsRepo = core.settingsRepo
     private val readerPrefsRepo = core.readerPrefsRepo
     private val recentRepo = core.recentRepo
     private val progressRepo = core.progressRepo
@@ -183,7 +61,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         translationJobs.values.forEach { it.cancel() }
         translationJobs.clear()
     }
-    private val client = core.llmClient
+    internal val client = core.llmClient
     private val translator = core.translator
     private val parser = core.documentParser
     private val webCache = core.webCache
@@ -197,11 +75,11 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     private val discoveryTxRepo = core.discoveryTxRepo
     private val localGlossary = core.localGlossary
     private val webRegistry = core.createWebRegistry { _state.value.readerPrefs }
-    private val imageGenRepo = core.imageGenRepo
-    private val characterRepo = core.characterRepo
-    private val imageCache = core.imageCache
-    private val novelAi = core.novelAi
-    private val comfyUi = core.comfyUi
+    internal val imageGenRepo = core.imageGenRepo
+    internal val characterRepo = core.characterRepo
+    internal val imageCache = core.imageCache
+    internal val novelAi = core.novelAi
+    internal val comfyUi = core.comfyUi
     /** 序列化"读缓存→改→写缓存"，避免懒加载和预取互相覆盖。 */
     private val cacheMutex = Mutex()
 
@@ -212,7 +90,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     /** 详情页选中的章节：openBook/openWebBook 完成后跳到该章。 */
     private var pendingInitialChapter: Int? = null
 
-    private val _state = MutableStateFlow(ReaderUiState())
+    internal val _state = MutableStateFlow(ReaderUiState())
     val state: StateFlow<ReaderUiState> = _state.asStateFlow()
 
     val recents: StateFlow<List<RecentBook>> = recentRepo.recents.stateIn(
@@ -2746,7 +2624,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun currentChapterText(state: ReaderUiState): String? {
+    internal fun currentChapterText(state: ReaderUiState): String? {
         val book = state.book as? BookContent.Text ?: return null
         return book.chapters.getOrNull(state.currentChapter)?.content?.let { stripHtml(it) }
     }
@@ -2754,391 +2632,40 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     // ===================== 图片生成 (M2-M6) =====================
 
     /** 当前书的稳定 ID（优先使用 web canonical url）。 */
-    private fun currentBookId(): String? {
+    internal fun currentBookId(): String? {
         val s = _state.value
         val title = s.book?.title ?: return null
         return s.webCanonicalUrl ?: "file:$title"
     }
 
-    /** 加载当前章节已生成的图片列表，刷新到 state。 */
-    fun refreshChapterImages() {
-        val bookId = currentBookId() ?: return
-        val idx = _state.value.currentChapter
-        viewModelScope.launch {
-            val list = imageCache.list(bookId, idx)
-            _state.update { it.copy(chapterImages = list) }
-        }
-    }
-
-    fun saveImageGenSettings(s: com.zzy.llmreader.data.ImageGenSettings) {
-        viewModelScope.launch { imageGenRepo.update(s) }
-    }
-
-    fun saveCharacterLibrary(lib: com.zzy.llmreader.image.CharacterLibrary) {
-        viewModelScope.launch { characterRepo.update(lib) }
-    }
-
-    fun clearImageGenError() {
-        if (_state.value.imageGenError != null) {
-            _state.update { it.copy(imageGenError = null) }
-        }
-    }
-
     /**
-     * 用 LLM 从当前章节抽取场景，输出 Danbooru 风格的英文 tag。
-     */
-    fun extractScenePrompt(callback: (Result<String>) -> Unit) {
-        val cur = _state.value
-        val ctx = currentChapterText(cur).orEmpty()
-        if (ctx.isBlank()) {
-            callback(Result.failure(IllegalStateException("当前章节为空")))
-            return
-        }
-        viewModelScope.launch {
-            val settings = settingsRepo.settings.first()
-            val excerpt = ctx.take(4000)
-            val msgs = listOf(
-                ChatMessage(
-                    role = "system",
-                    content = "你是 Danbooru 风格的图像生成 prompt 工程师。" +
-                        "用户给你一段小说章节正文，你要选出最具画面感的一个场景（人物、动作、环境、氛围），" +
-                        "输出英文逗号分隔的 tag 序列；不要任何中文，不要句子，不要解释，不要 NSFW 触发词；" +
-                        "20-40 个 tag 之间。",
-                ),
-                ChatMessage(role = "user", content = "章节正文：\n$excerpt\n\n请输出 tag 序列。"),
-            )
-            client.chat(settings, msgs)
-                .map { raw ->
-                    raw.lineSequence()
-                        .map { it.trim() }
-                        .filter { it.isNotBlank() && !it.startsWith("#") }
-                        .joinToString(", ")
-                        .replace(Regex("\\s*,\\s*"), ", ")
-                        .trim(',', ' ')
-                }
-                .let(callback)
-        }
-    }
-
-    /** 触发一次图片生成，结果（成功时）已经保存进 ImageCache，会自动刷新 chapterImages。 */
-    fun generateImage(positivePrompt: String, callback: (Result<com.zzy.llmreader.image.ImageCache.GeneratedImage>) -> Unit) {
-        val cur = _state.value
-        val bookId = currentBookId()
-        if (bookId == null) {
-            callback(Result.failure(IllegalStateException("请先打开一本书")))
-            return
-        }
-        val backend = cur.imageGenSettings.backend
-        if (backend == com.zzy.llmreader.data.ImageBackend.NONE) {
-            callback(Result.failure(IllegalStateException("请先在「图片生成 → 设置」选择后端 (NovelAI / ComfyUI)")))
-            return
-        }
-        val idx = cur.currentChapter
-        val sceneText = currentChapterText(cur).orEmpty()
-        // 自动追加角色相关的外观/穿着
-        val charAddon = characterRepo.buildAutoPromptAddon(cur.characterLibrary, sceneText)
-        val finalPrompt = listOf(positivePrompt, charAddon).filter { it.isNotBlank() }.joinToString(", ")
-
-        _state.update { it.copy(generatingImage = true, imageGenError = null) }
-        viewModelScope.launch {
-            val result = runCatching {
-                val s = cur.imageGenSettings
-                when (backend) {
-                    com.zzy.llmreader.data.ImageBackend.NOVELAI ->
-                        novelAi.generate(s, finalPrompt) to (s.novelaiWidth to s.novelaiHeight)
-                    com.zzy.llmreader.data.ImageBackend.COMFYUI ->
-                        comfyUi.generate(s, finalPrompt) to (s.comfyuiWidth to s.comfyuiHeight)
-                    com.zzy.llmreader.data.ImageBackend.NONE -> error("unreachable")
-                }
-            }.mapCatching { (bytes, size) ->
-                imageCache.save(
-                    bookId = bookId,
-                    chapterIndex = idx,
-                    bytes = bytes,
-                    prompt = finalPrompt,
-                    negative = when (backend) {
-                        com.zzy.llmreader.data.ImageBackend.NOVELAI -> cur.imageGenSettings.novelaiNegativePrompt
-                        com.zzy.llmreader.data.ImageBackend.COMFYUI -> cur.imageGenSettings.comfyuiNegativePrompt
-                        else -> ""
-                    },
-                    backend = backend,
-                    width = size.first,
-                    height = size.second,
-                )
-            }
-            _state.update { it.copy(generatingImage = false) }
-            result.onSuccess { entry ->
-                val list = imageCache.list(bookId, idx)
-                _state.update { it.copy(chapterImages = list) }
-                callback(Result.success(entry))
-            }.onFailure { err ->
-                Log.e(TAG, "image generation failed", err)
-                _state.update { it.copy(imageGenError = err.message) }
-                callback(Result.failure(err))
-            }
-        }
-    }
-
-    fun deleteGeneratedImage(id: String) {
-        val bookId = currentBookId() ?: return
-        val idx = _state.value.currentChapter
-        viewModelScope.launch {
-            imageCache.delete(bookId, idx, id)
-            val list = imageCache.list(bookId, idx)
-            _state.update { it.copy(chapterImages = list) }
-        }
-    }
-
-    /** 给定一个 prompt，查找该 prompt 在当前书内是否已生成过图片，返回本地文件。 */
-    suspend fun findCachedImageByPrompt(prompt: String): java.io.File? {
-        val bookId = currentBookId() ?: return null
-        return imageCache.fileForPrompt(bookId, prompt)
-    }
-
-    /**
-     * 用于"在文中插入插图"：根据 prompt 直接生成一张，不依赖当前章节已生成列表。
-     * 完成后会刷新当前章节的图片列表（如果生成的是同一章），方便面板/按 prompt 查找。
-     */
-    fun generateInlineImage(prompt: String, callback: (Result<com.zzy.llmreader.image.ImageCache.GeneratedImage>) -> Unit) {
-        // 直接复用 generateImage 即可：它已经把图片写到当前章节目录下，
-        // findCachedImageByPrompt 跨章节查找时也能命中。
-        generateImage(prompt, callback)
-    }
-
-    /**
-     * 批量生成本章所有 [IMG: ...] 标记对应的插图。
-     * - 已缓存（按 prompt 命中）的会跳过
-     * - 串行执行，避免后端被打爆
-     * - 通过 [onProgress] 上报 (current, total, currentPrompt)
-     * - 通过 [onDone] 上报 (success, failed)
-     */
-    fun generateAllInlinePrompts(
-        prompts: List<String>,
-        onProgress: (current: Int, total: Int, prompt: String) -> Unit = { _, _, _ -> },
-        onDone: (success: Int, failed: Int) -> Unit = { _, _ -> },
-    ) {
-        val bookId = currentBookId()
-        if (bookId == null) {
-            onDone(0, prompts.size)
-            return
-        }
-        val backend = _state.value.imageGenSettings.backend
-        if (backend == com.zzy.llmreader.data.ImageBackend.NONE) {
-            _state.update { it.copy(imageGenError = "请先在「图片生成 → 设置」选择后端") }
-            onDone(0, prompts.size)
-            return
-        }
-        viewModelScope.launch {
-            val unique = prompts.distinct()
-            var ok = 0
-            var fail = 0
-            for ((i, p) in unique.withIndex()) {
-                onProgress(i + 1, unique.size, p)
-                // 已缓存则跳过
-                val existing = imageCache.fileForPrompt(bookId, p)
-                if (existing != null) {
-                    ok++
-                    continue
-                }
-                val result = kotlinx.coroutines.suspendCancellableCoroutine<Result<com.zzy.llmreader.image.ImageCache.GeneratedImage>> { cont ->
-                    generateImage(p) { r -> if (cont.isActive) cont.resumeWith(Result.success(r)) }
-                }
-                if (result.isSuccess) ok++ else fail++
-            }
-            onDone(ok, fail)
-        }
-    }
-
-    /** 获取一张已保存图片的本地文件路径。 */
-    fun imageFilePath(filename: String): String? {
-        val bookId = currentBookId() ?: return null
-        val idx = _state.value.currentChapter
-        return imageCache.fileFor(bookId, idx, filename).absolutePath
-    }
-
-    /**
-     * 从 SillyTavern st-chatu8 的 settings JSON 中导入图片生成相关配置。
-     * 仅取我们当前支持的字段；其余忽略。
+     * 从 SillyTavern st-chatu8 的 settings JSON 导入图片生成配置与角色库。
+     *
+     * 解析逻辑放在 shared 的 [com.zzy.llmreader.image.StChatu8Importer]（纯函数，
+     * 有单元测试覆盖）；这里只负责 JSON 解析的线程切换、持久化和回调。
      */
     fun importStChatu8Settings(jsonText: String, callback: (Result<String>) -> Unit) {
         viewModelScope.launch {
             val result = runCatching {
-                val root = withContext(Dispatchers.IO) {
-                    kotlinx.serialization.json.Json.parseToJsonElement(jsonText)
-                } as? kotlinx.serialization.json.JsonObject
-                    ?: error("不是合法的 JSON 对象")
-                // 兼容两种格式：
-                //  1. 顶层就是 st-chatu8 的 settings（用户从插件页面"导出当前配置"得到的格式）
-                //  2. 整个 SillyTavern settings.json，包在 extension_settings['st-chatu8'] 里
-                val sc = (root["extension_settings"] as? kotlinx.serialization.json.JsonObject)
-                    ?.get("st-chatu8") as? kotlinx.serialization.json.JsonObject
-                    ?: root // 直接用顶层
-                applyStChatu8(sc)
-            }
-            result.onSuccess { msg ->
-                callback(Result.success(msg))
-            }.onFailure { callback(Result.failure(it)) }
-        }
-    }
-
-    private suspend fun applyStChatu8(sc: kotlinx.serialization.json.JsonObject): String {
-        val cur = _state.value.imageGenSettings
-        fun str(key: String) = (sc[key] as? kotlinx.serialization.json.JsonPrimitive)?.content
-        fun num(key: String) = str(key)?.toDoubleOrNull()
-        fun int(key: String) = str(key)?.toIntOrNull()
-        fun bool(key: String) = str(key)?.let {
-            when (it.lowercase()) {
-                "true", "1", "yes" -> true
-                "false", "0", "no", "" -> false
-                else -> null
-            }
-        }
-
-        // 后端选择：client=jiuguan 视为 ComfyUI（jiuguan 是九馆代理 ComfyUI 的方式），
-        // client=novelai → NovelAI；其他保持原值。
-        val client = str("client") ?: ""
-        val backend = when (client) {
-            "novelai" -> com.zzy.llmreader.data.ImageBackend.NOVELAI
-            "comfy", "comfyui", "jiuguan" -> com.zzy.llmreader.data.ImageBackend.COMFYUI
-            else -> if (cur.backend == com.zzy.llmreader.data.ImageBackend.NONE) {
-                com.zzy.llmreader.data.ImageBackend.NOVELAI
-            } else cur.backend
-        }
-
-        val site = when (str("novelaisite")) {
-            "官网", "official", "main" -> "official"
-            null -> cur.novelaiSite
-            else -> "custom"
-        }
-
-        var newSettings = cur.copy(
-            backend = backend,
-            novelaiApiKey = str("novelaiApi") ?: cur.novelaiApiKey,
-            novelaiSite = site,
-            novelaiCustomUrl = str("novelaiOtherSite") ?: cur.novelaiCustomUrl,
-            novelaiModel = str("novelaimode") ?: cur.novelaiModel,
-            novelaiSampler = str("novelai_sampler") ?: cur.novelaiSampler,
-            novelaiSteps = int("novelai_steps") ?: cur.novelaiSteps,
-            novelaiWidth = int("novelai_width") ?: cur.novelaiWidth,
-            novelaiHeight = int("novelai_height") ?: cur.novelaiHeight,
-            novelaiSeed = str("novelai_seed")?.toLongOrNull() ?: cur.novelaiSeed,
-            novelaiScale = num("nai3Scale") ?: cur.novelaiScale,
-            novelaiDecrisper = bool("nai3Deceisp") ?: cur.novelaiDecrisper,
-            novelaiVarietyBoost = bool("nai3Variety") ?: cur.novelaiVarietyBoost,
-            comfyuiUrl = str("comfyuiUrl") ?: cur.comfyuiUrl,
-            comfyuiSampler = str("comfyuisamplerName") ?: cur.comfyuiSampler,
-            comfyuiScheduler = str("comfyui_scheduler") ?: cur.comfyuiScheduler,
-            comfyuiCfg = num("cfg_comfyui") ?: cur.comfyuiCfg,
-            comfyuiSteps = int("comfyui_steps") ?: cur.comfyuiSteps,
-            comfyuiWidth = int("comfyui_width") ?: cur.comfyuiWidth,
-            comfyuiHeight = int("comfyui_height") ?: cur.comfyuiHeight,
-            comfyuiSeed = str("comfyui_seed")?.toLongOrNull() ?: cur.comfyuiSeed,
-        )
-
-        // ComfyUI 工作流：优先用当前激活的 workerid，否则取 workers map 第一个。
-        // workers 里有些条目可能不是工作流（例如 "links"/"last_link_id"），跳过。
-        val workersMap = sc["workers"] as? kotlinx.serialization.json.JsonObject
-        var wfCount = 0
-        if (workersMap != null) {
-            val activeName = str("workerid")
-            val candidates = listOfNotNull(activeName) + workersMap.keys
-            val pick = candidates.firstOrNull { name ->
-                val v = workersMap[name]
-                val text = (v as? kotlinx.serialization.json.JsonPrimitive)?.content
-                    ?: v?.toString()
-                text != null && text.contains("class_type")
-            }
-            wfCount = workersMap.values.count {
-                val t = (it as? kotlinx.serialization.json.JsonPrimitive)?.content ?: it.toString()
-                t.contains("class_type")
-            }
-            if (pick != null) {
-                val raw = workersMap[pick]
-                val wfJson = (raw as? kotlinx.serialization.json.JsonPrimitive)?.content
-                    ?: raw?.toString()
-                if (wfJson != null) {
-                    newSettings = newSettings.copy(
-                        comfyuiWorkflowName = pick,
-                        comfyuiWorkflowJson = wfJson,
+                val imported = withContext(Dispatchers.IO) {
+                    com.zzy.llmreader.image.StChatu8Importer.importFromText(
+                        jsonText,
+                        _state.value.imageGenSettings,
                     )
                 }
-            }
-        }
-
-        imageGenRepo.update(newSettings)
-
-        val charLib = parseStChatu8Characters(sc)
-        if (charLib.characters.isNotEmpty() || charLib.outfits.isNotEmpty()) {
-            characterRepo.update(charLib)
-        }
-
-        return buildString {
-            append("已导入：后端=${backend.name}")
-            if (charLib.characters.isNotEmpty()) append(", 角色 ${charLib.characters.size} 个")
-            if (charLib.outfits.isNotEmpty()) append(", 装束 ${charLib.outfits.size} 个")
-            if (wfCount > 0) append(", ComfyUI 工作流 $wfCount 个（已选 \"${newSettings.comfyuiWorkflowName}\"）")
-        }
-    }
-
-    private fun parseStChatu8Characters(sc: kotlinx.serialization.json.JsonObject): com.zzy.llmreader.image.CharacterLibrary {
-        // st-chatu8 格式：characterPresets / outfitPresets 是 dict<name, dict>。
-        // 也兼容 jueselist / outfitslist / characters / outfits 的列表写法。
-        fun extractDict(key: String): List<Pair<String, kotlinx.serialization.json.JsonObject>> {
-            val node = sc[key] ?: return emptyList()
-            return when (node) {
-                is kotlinx.serialization.json.JsonObject -> node.entries.mapNotNull { (k, v) ->
-                    (v as? kotlinx.serialization.json.JsonObject)?.let { k to it }
+                imageGenRepo.update(imported.settings)
+                if (imported.library.characters.isNotEmpty() || imported.library.outfits.isNotEmpty()) {
+                    characterRepo.update(imported.library)
                 }
-                is kotlinx.serialization.json.JsonArray -> node.mapIndexedNotNull { i, v ->
-                    (v as? kotlinx.serialization.json.JsonObject)?.let { o ->
-                        val name = (o["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content
-                            ?: i.toString()
-                        name to o
-                    }
-                }
-                else -> emptyList()
+                imported.summary
             }
+            result.onSuccess { callback(Result.success(it)) }
+                .onFailure { callback(Result.failure(it)) }
         }
-        fun JsonElementGet(o: kotlinx.serialization.json.JsonObject, vararg keys: String): String? {
-            for (k in keys) {
-                val v = o[k]
-                val s = (v as? kotlinx.serialization.json.JsonPrimitive)?.content
-                if (!s.isNullOrBlank()) return s
-            }
-            return null
-        }
-
-        val outfitsRaw = extractDict("outfitPresets") + extractDict("outfitslist") + extractDict("outfits")
-        val outfits = outfitsRaw.distinctBy { it.first }.map { (name, o) ->
-            com.zzy.llmreader.image.OutfitPreset(
-                id = JsonElementGet(o, "id") ?: "o_$name",
-                name = JsonElementGet(o, "name") ?: name,
-                prompt = JsonElementGet(o, "prompt", "tags", "positive", "content") ?: "",
-                notes = JsonElementGet(o, "notes", "description") ?: "",
-            )
-        }.filter { it.name.isNotBlank() }
-
-        val charsRaw = extractDict("characterPresets") + extractDict("jueselist") + extractDict("characters")
-        val chars = charsRaw.distinctBy { it.first }.map { (name, c) ->
-            val aliasArr = c["aliases"] as? kotlinx.serialization.json.JsonArray
-            com.zzy.llmreader.image.CharacterPreset(
-                id = JsonElementGet(c, "id") ?: "c_$name",
-                name = JsonElementGet(c, "name") ?: name,
-                englishName = JsonElementGet(c, "english", "en", "englishName") ?: "",
-                aliases = aliasArr?.mapNotNull {
-                    (it as? kotlinx.serialization.json.JsonPrimitive)?.content
-                } ?: emptyList(),
-                appearancePrompt = JsonElementGet(c, "appearance", "prompt", "tags", "positive", "content") ?: "",
-                defaultOutfitId = JsonElementGet(c, "defaultOutfit", "outfit", "outfitId"),
-                notes = JsonElementGet(c, "notes", "description") ?: "",
-            )
-        }.filter { it.name.isNotBlank() }
-
-        return com.zzy.llmreader.image.CharacterLibrary(characters = chars, outfits = outfits)
     }
 
     companion object {
-        private const val TAG = "ReaderVM"
+        internal const val TAG = "ReaderVM"
     }
 }
 

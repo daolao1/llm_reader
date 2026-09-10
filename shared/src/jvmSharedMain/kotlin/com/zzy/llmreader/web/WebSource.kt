@@ -1,6 +1,7 @@
 package com.zzy.llmreader.web
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.CipherSuite
 import okhttp3.ConnectionSpec
@@ -104,63 +105,33 @@ abstract class HtmlWebSource : WebSource {
             .build()
     }
 
-    protected suspend fun fetchDocument(url: String): Document = withContext(Dispatchers.IO) {
-        val builder = Request.Builder()
-            .url(url.toHttpUrl())
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .header("Accept-Language", "ja,en-US;q=0.7,en;q=0.3")
-            .header("User-Agent", userAgent)
-            .get()
-        extraHeaders.forEach { (k, v) -> builder.header(k, v) }
-        val req = builder.build()
-
-        // 对 5xx（尤其 Cloudflare 520/521/522/523/524/525/526/530）做有限次重试。
-        val maxAttempts = 8
-        var lastError: String? = null
-        for (attempt in 1..maxAttempts) {
-            val response = try {
-                client.newCall(req).execute()
-            } catch (t: Throwable) {
-                lastError = t.javaClass.simpleName + ": " + (t.message ?: "")
-                // 关闭连接池中可能死掉的连接，下一次重试拿新连接
-                runCatching { client.connectionPool.evictAll() }
-                if (attempt < maxAttempts) {
-                    kotlinx.coroutines.delay(minOf(1500L * attempt, 6000L))
-                    continue
-                }
-                throw t
-            }
-            response.use { r ->
-                val html = r.body?.string().orEmpty()
-                if (r.isSuccessful) {
-                    require(html.isNotBlank()) { "网页内容为空" }
-                    return@withContext Jsoup.parse(html, r.request.url.toString())
-                }
-                lastError = "HTTP ${r.code}"
-                // CF 挑战页：靠重试不会自动好，立刻抛出让 UI 引导用户走 WebView 拿 cookie。
-                if (r.code in setOf(403, 503, 520, 521, 522, 523, 524, 525, 526, 527, 530) &&
-                    looksLikeCloudflare(html, r.headers)
-                ) {
-                    throw CloudflareBlockedException(url, r.code)
-                }
-                // 仅对 5xx / 408 / 429 重试
-                val retriable = r.code in 500..599 || r.code == 408 || r.code == 429
-                if (!retriable || attempt >= maxAttempts) {
-                    error("网页请求失败：HTTP ${r.code}")
-                }
-            }
-            // CF 边缘异常时把可能粘住的连接也踢掉
-            runCatching { client.connectionPool.evictAll() }
-            kotlinx.coroutines.delay(minOf(1500L * attempt, 6000L))
-        }
-        error("网页请求失败（已重试 $maxAttempts 次）：$lastError")
+    /** 抓页面并解析成 Jsoup Document。 */
+    protected suspend fun fetchDocument(url: String): Document {
+        val (body, finalUrl) = executeWithRetry(url, accept = DEFAULT_ACCEPT)
+        return Jsoup.parse(body, finalUrl)
     }
 
+    /** 抓原始响应体（站点 JSON / XML 接口用）。 */
     protected suspend fun fetchString(
         url: String,
-        accept: String = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        accept: String = DEFAULT_ACCEPT,
         extra: Map<String, String> = emptyMap(),
-    ): String = withContext(Dispatchers.IO) {
+    ): String = executeWithRetry(url, accept = accept, extra = extra).first
+
+    /**
+     * 带重试的 GET，两个 fetch 的唯一实现。
+     *
+     * 合并前 `fetchDocument` 与 `fetchString` 各自抄了一份几乎相同的重试 /
+     * Cloudflare 识别 / 连接池清理逻辑（约 80 行 ×2），改一处很容易漏另一处。
+     *
+     * @return Pair(响应体, 最终 URL)。最终 URL 会因为重定向而变化，
+     *         Jsoup 解析相对链接时必须用它而不是原始 URL。
+     */
+    private suspend fun executeWithRetry(
+        url: String,
+        accept: String,
+        extra: Map<String, String> = emptyMap(),
+    ): Pair<String, String> = withContext(Dispatchers.IO) {
         val builder = Request.Builder()
             .url(url.toHttpUrl())
             .header("Accept", accept)
@@ -170,16 +141,18 @@ abstract class HtmlWebSource : WebSource {
         extraHeaders.forEach { (k, v) -> builder.header(k, v) }
         extra.forEach { (k, v) -> builder.header(k, v) }
         val req = builder.build()
-        val maxAttempts = 8
+
+        // 对 5xx（尤其 Cloudflare 520/521/522/523/524/525/526/530）做有限次重试。
         var lastError: String? = null
-        for (attempt in 1..maxAttempts) {
+        for (attempt in 1..MAX_ATTEMPTS) {
             val response = try {
                 client.newCall(req).execute()
             } catch (t: Throwable) {
                 lastError = t.javaClass.simpleName + ": " + (t.message ?: "")
+                // 关闭连接池中可能死掉的连接，下一次重试拿新连接
                 runCatching { client.connectionPool.evictAll() }
-                if (attempt < maxAttempts) {
-                    kotlinx.coroutines.delay(minOf(1500L * attempt, 6000L))
+                if (attempt < MAX_ATTEMPTS) {
+                    delay(minOf(1500L * attempt, 6000L))
                     continue
                 }
                 throw t
@@ -188,23 +161,24 @@ abstract class HtmlWebSource : WebSource {
                 val body = r.body?.string().orEmpty()
                 if (r.isSuccessful) {
                     require(body.isNotBlank()) { "网页内容为空" }
-                    return@withContext body
+                    return@withContext body to r.request.url.toString()
                 }
                 lastError = "HTTP ${r.code}"
-                if (r.code in setOf(403, 503, 520, 521, 522, 523, 524, 525, 526, 527, 530) &&
-                    looksLikeCloudflare(body, r.headers)
-                ) {
+                // CF 挑战页：靠重试不会自动好，立刻抛出让 UI 引导用户走 WebView 拿 cookie。
+                if (r.code in CLOUDFLARE_STATUS && looksLikeCloudflare(body, r.headers)) {
                     throw CloudflareBlockedException(url, r.code)
                 }
+                // 仅对 5xx / 408 / 429 重试
                 val retriable = r.code in 500..599 || r.code == 408 || r.code == 429
-                if (!retriable || attempt >= maxAttempts) {
+                if (!retriable || attempt >= MAX_ATTEMPTS) {
                     error("网页请求失败：HTTP ${r.code}")
                 }
             }
+            // CF 边缘异常时把可能粘住的连接也踢掉
             runCatching { client.connectionPool.evictAll() }
-            kotlinx.coroutines.delay(minOf(1500L * attempt, 6000L))
+            delay(minOf(1500L * attempt, 6000L))
         }
-        error("网页请求失败（已重试 $maxAttempts 次）：$lastError")
+        error("网页请求失败（已重试 $MAX_ATTEMPTS 次）：$lastError")
     }
 
     private fun looksLikeCloudflare(body: String, headers: okhttp3.Headers): Boolean {
@@ -223,6 +197,15 @@ abstract class HtmlWebSource : WebSource {
     }
 
     companion object {
+        private const val DEFAULT_ACCEPT =
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+        private const val MAX_ATTEMPTS = 8
+
+        /** 视为 Cloudflare 拦截、需要人工过验证的状态码。 */
+        private val CLOUDFLARE_STATUS =
+            setOf(403, 503, 520, 521, 522, 523, 524, 525, 526, 527, 530)
+
         const val DEFAULT_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; LLMReader) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 

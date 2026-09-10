@@ -43,11 +43,10 @@ kotlin {
             }
         }
 
+        // 目前 androidMain 不需要额外的 Android 专属依赖：
+        // org.json 由系统 android.jar 提供，日志走 commonMain 的 expect/actual。
         val androidMain by getting {
             dependsOn(jvmSharedMain)
-            dependencies {
-                implementation(libs.conscrypt.android)
-            }
         }
 
         val desktopMain by getting {

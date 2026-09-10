@@ -105,6 +105,17 @@ import com.zzy.llmreader.web.WebSource
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.zzy.llmreader.ui.reader.clearImageGenError
+import com.zzy.llmreader.ui.reader.deleteGeneratedImage
+import com.zzy.llmreader.ui.reader.extractScenePrompt
+import com.zzy.llmreader.ui.reader.findCachedImageByPrompt
+import com.zzy.llmreader.ui.reader.generateAllInlinePrompts
+import com.zzy.llmreader.ui.reader.generateImage
+import com.zzy.llmreader.ui.reader.generateInlineImage
+import com.zzy.llmreader.ui.reader.imageFilePath
+import com.zzy.llmreader.ui.reader.refreshChapterImages
+import com.zzy.llmreader.ui.reader.saveCharacterLibrary
+import com.zzy.llmreader.ui.reader.saveImageGenSettings
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
