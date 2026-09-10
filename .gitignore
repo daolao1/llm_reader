@@ -1,0 +1,26 @@
+# ---- 构建产物 ----
+*.iml
+.gradle/
+.idea/
+.kotlin/
+build/
+.cxx/
+captures/
+.externalNativeBuild/
+*.apk
+*.aab
+
+# ---- 签名与本地配置（绝对不要提交）----
+*.keystore
+*.jks
+!debug.keystore
+*.keystore.base64
+local.properties
+.claude/settings.local.json
+
+# ---- 开发期素材（代码中无引用，属于本地参考资料）----
+downloads/
+【人间月下】V1.29（正式版）.json
+
+# ---- 系统 ----
+.DS_Store

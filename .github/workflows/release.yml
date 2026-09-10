@@ -1,0 +1,398 @@
+# =============================================================================
+# Release workflow - llm_reader (Kotlin Multiplatform: Android + Compose Desktop)
+#
+# Triggers
+#   * push of a tag matching "v*"  -> version comes from the tag (v1.2.3 -> 1.2.3)
+#   * workflow_dispatch            -> version comes from the "version" input,
+#                                     falling back to DEFAULT_VERSION (0.1.0)
+#
+# Every Gradle invocation receives -PversionName=<name> and
+# -PversionCode=<major*10000 + minor*100 + patch>, so the build scripts can read
+# them as plain project properties (providers.gradleProperty("versionName")).
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions)
+#   RELEASE_KEYSTORE_BASE64  base64 of the release keystore (.jks / .keystore)
+#   RELEASE_STORE_PASSWORD   keystore password
+#   RELEASE_KEY_ALIAS        key alias inside the keystore
+#   RELEASE_KEY_PASSWORD     password for that key
+#
+# Exact command used to produce the base64 keystore value:
+#   macOS:       base64 -i release.keystore | tr -d '\n' > keystore.b64
+#   Linux:       base64 -w 0 release.keystore > keystore.b64
+#   PowerShell:  [Convert]::ToBase64String([IO.File]::ReadAllBytes("release.keystore")) | Set-Content keystore.b64
+#   (paste the single-line contents of keystore.b64 into RELEASE_KEYSTORE_BASE64)
+#
+# If those four secrets are missing, the android job does NOT fail: it prints a
+# warning and builds with the debug signing config instead (see the fallback in
+# app/build.gradle.kts), producing an installable but non-publishable APK.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version name to release, e.g. 1.2.3 or 1.2.3-beta.1 (ignored when running from a v* tag).'
+        required: false
+        type: string
+        default: ''
+
+# Least privilege by default; only the release job elevates to contents: write.
+permissions:
+  contents: read
+
+# One run per ref; superseded runs are cancelled - except for tag runs, which
+# are never cancelled (a published version must always finish).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  DEFAULT_VERSION: '1.0.0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve versionName / versionCode once and share them with every other job.
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_code: ${{ steps.version.outputs.version_code }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Derive versionName and versionCode
+        id: version
+        env:
+          # Passed through env (not interpolated into the script) to avoid
+          # injecting user input into the shell.
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            origin="tag ${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION#v}"
+            origin="workflow_dispatch input"
+          else
+            version="${DEFAULT_VERSION}"
+            origin="fallback default"
+          fi
+
+          # Trim whitespace and refuse anything that is not semver-ish, so the
+          # value stays safe to put on a command line.
+          version="$(printf '%s' "${version}" | tr -d '[:space:]')"
+          if [ -z "${version}" ]; then
+            version="${DEFAULT_VERSION}"
+            origin="fallback default"
+          fi
+          if ! printf '%s' "${version}" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid version '${version}' (from ${origin}). Expected a semver-like value such as 1.2.3 or 1.2.3-beta.1."
+            exit 1
+          fi
+
+          # versionCode = major * 10000 + minor * 100 + patch
+          core="${version%%-*}"
+          core="${core%%+*}"
+          IFS='.' read -r major minor patch <<< "${core}"
+          major="${major:-0}"
+          minor="${minor:-0}"
+          patch="${patch:-0}"
+          for part in "${major}" "${minor}" "${patch}"; do
+            if ! printf '%s' "${part}" | grep -Eq '^[0-9]+$'; then
+              echo "::error::Could not derive an integer versionCode from '${version}'."
+              exit 1
+            fi
+          done
+          version_code=$(( 10#${major} * 10000 + 10#${minor} * 100 + 10#${patch} ))
+
+          prerelease=false
+          case "${version}" in
+            *-*) prerelease=true ;;
+          esac
+
+          tag="v${version}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          {
+            echo "version=${version}"
+            echo "version_code=${version_code}"
+            echo "tag=${tag}"
+            echo "prerelease=${prerelease}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Release ${tag}"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| source | ${origin} |"
+            echo "| versionName | \`${version}\` |"
+            echo "| versionCode | \`${version_code}\` |"
+            echo "| release tag | \`${tag}\` |"
+            echo "| prerelease | \`${prerelease}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "version=${version} versionCode=${version_code} tag=${tag} prerelease=${prerelease} (${origin})"
+
+  # ---------------------------------------------------------------------------
+  # Android release APK (signed when the signing secrets exist).
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    needs: prepare
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK (platform 34, build-tools 34.0.0)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0'
+          accept-android-sdk-licenses: true
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Neutralize a hard-coded org.gradle.java.home
+        shell: bash
+        run: |
+          set -euo pipefail
+          # gradle.properties may still pin org.gradle.java.home to a developer
+          # machine path (e.g. /opt/homebrew/opt/openjdk@17/...). On a runner that
+          # path does not exist and Gradle would abort, so drop the line when the
+          # directory is missing and let JAVA_HOME (actions/setup-java) win.
+          if [ -f gradle.properties ] && grep -Eq '^[[:space:]]*org\.gradle\.java\.home=' gradle.properties; then
+            configured_home="$(grep -E '^[[:space:]]*org\.gradle\.java\.home=' gradle.properties | tail -n 1 | cut -d '=' -f 2- | tr -d '[:space:]')"
+            if [ ! -d "${configured_home}" ]; then
+              echo "::warning::gradle.properties sets org.gradle.java.home='${configured_home}', which does not exist on this runner. Removing that line for this build; JAVA_HOME='${JAVA_HOME:-unset}' is used instead."
+              sed -i.bak -E '/^[[:space:]]*org\.gradle\.java\.home=/d' gradle.properties
+            else
+              echo "org.gradle.java.home='${configured_home}' exists on this runner; leaving gradle.properties untouched."
+            fi
+          else
+            echo "No hard-coded org.gradle.java.home found; JAVA_HOME='${JAVA_HOME:-unset}' is used."
+          fi
+
+      - name: Prepare release signing configuration
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64}" ] || [ -z "${STORE_PASSWORD}" ] || [ -z "${KEY_ALIAS}" ] || [ -z "${KEY_PASSWORD}" ]; then
+            echo "::warning title=Debug-signed release build::RELEASE_KEYSTORE_BASE64 / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD are not all configured. app/build.gradle.kts falls back to the debug signing config in that case, so the APK will be installable but signed with the debug key and NOT publishable to Google Play."
+            echo "signed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          keystore_file="${RUNNER_TEMP}/release.keystore"
+          umask 077
+          if ! printf '%s' "${KEYSTORE_BASE64}" | tr -d '\r\n ' | base64 --decode > "${keystore_file}"; then
+            echo "::error title=Invalid keystore::RELEASE_KEYSTORE_BASE64 is not valid base64. Re-generate it with: base64 -w 0 release.keystore"
+            exit 1
+          fi
+          if [ ! -s "${keystore_file}" ]; then
+            echo "::error title=Invalid keystore::RELEASE_KEYSTORE_BASE64 did not decode to a non-empty file. Re-generate it with: base64 -w 0 release.keystore"
+            exit 1
+          fi
+
+          echo "Decoded the release keystore to a temporary file."
+          echo "keystore_file=${keystore_file}" >> "${GITHUB_OUTPUT}"
+          echo "signed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Build release APK
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          KEYSTORE_FILE: ${{ steps.signing.outputs.keystore_file }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          VERSION_NAME: ${{ needs.prepare.outputs.version }}
+          VERSION_CODE: ${{ needs.prepare.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          args=(-PversionName="${VERSION_NAME}" -PversionCode="${VERSION_CODE}")
+          if [ "${SIGNED}" = "true" ]; then
+            echo "Signing the release APK with the configured keystore."
+            args+=(
+              -PRELEASE_STORE_FILE="${KEYSTORE_FILE}"
+              -PRELEASE_STORE_PASSWORD="${RELEASE_STORE_PASSWORD}"
+              -PRELEASE_KEY_ALIAS="${RELEASE_KEY_ALIAS}"
+              -PRELEASE_KEY_PASSWORD="${RELEASE_KEY_PASSWORD}"
+            )
+          else
+            echo "::warning::No signing secrets available - :app:assembleRelease runs without signing properties, so app/build.gradle.kts falls back to the debug signing config (installable, not Play-publishable)."
+          fi
+          ./gradlew :app:assembleRelease "${args[@]}"
+
+      - name: Show produced APK(s)
+        if: always()
+        shell: bash
+        run: ls -l app/build/outputs/apk/release/ || true
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
+
+      - name: Remove decoded keystore
+        if: always()
+        env:
+          KEYSTORE_FILE: ${{ steps.signing.outputs.keystore_file }}
+        run: |
+          if [ -n "${KEYSTORE_FILE}" ] && [ -f "${KEYSTORE_FILE}" ]; then
+            rm -f "${KEYSTORE_FILE}"
+            echo "Removed the temporary keystore."
+          else
+            echo "No temporary keystore to remove."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Compose Desktop installers: .deb on Linux, .msi on Windows, .dmg on macOS.
+  # ---------------------------------------------------------------------------
+  desktop:
+    name: Desktop ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: prepare
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            task: packageDeb
+            gradle: ./gradlew
+            out_dir: deb
+            ext: deb
+          - os: windows-latest
+            task: packageMsi
+            gradle: ./gradlew.bat
+            out_dir: msi
+            ext: msi
+          - os: macos-latest
+            task: packageDmg
+            gradle: ./gradlew
+            out_dir: dmg
+            ext: dmg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Make Gradle wrapper executable
+        if: runner.os != 'Windows'
+        run: chmod +x ./gradlew
+
+      - name: Neutralize a hard-coded org.gradle.java.home
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same guard as the android job: ignore a developer-specific
+          # org.gradle.java.home that does not exist on this runner.
+          if [ -f gradle.properties ] && grep -Eq '^[[:space:]]*org\.gradle\.java\.home=' gradle.properties; then
+            configured_home="$(grep -E '^[[:space:]]*org\.gradle\.java\.home=' gradle.properties | tail -n 1 | cut -d '=' -f 2- | tr -d '[:space:]')"
+            if [ ! -d "${configured_home}" ]; then
+              echo "::warning::gradle.properties sets org.gradle.java.home='${configured_home}', which does not exist on this runner. Removing that line for this build; JAVA_HOME='${JAVA_HOME:-unset}' is used instead."
+              sed -i.bak -E '/^[[:space:]]*org\.gradle\.java\.home=/d' gradle.properties
+            else
+              echo "org.gradle.java.home='${configured_home}' exists on this runner; leaving gradle.properties untouched."
+            fi
+          else
+            echo "No hard-coded org.gradle.java.home found; JAVA_HOME='${JAVA_HOME:-unset}' is used."
+          fi
+
+      - name: Package ${{ matrix.ext }} installer
+        # The version was validated in the "prepare" job, so it is safe to inline.
+        run: ${{ matrix.gradle }} :desktop:${{ matrix.task }} -PversionName=${{ needs.prepare.outputs.version }} -PversionCode=${{ needs.prepare.outputs.version_code }}
+
+      - name: Show produced installer(s)
+        if: always()
+        shell: bash
+        run: ls -lR desktop/build/compose/binaries/main/${{ matrix.out_dir }}/ || true
+
+      - name: Upload ${{ matrix.ext }} installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.ext }}
+          path: desktop/build/compose/binaries/main/${{ matrix.out_dir }}/*.${{ matrix.ext }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish the GitHub Release with every installer attached.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - android
+      - desktop
+    if: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: write
+    timeout-minutes: 30
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lR dist
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Tag runs reuse the pushed tag; workflow_dispatch runs create
+          # v<version> at the commit that triggered the run (API --target).
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          fail_on_unmatched_files: false
+          files: |
+            dist/*.apk
+            dist/**/*.apk
+            dist/*.deb
+            dist/**/*.deb
+            dist/*.msi
+            dist/**/*.msi
+            dist/*.dmg
+            dist/**/*.dmg
