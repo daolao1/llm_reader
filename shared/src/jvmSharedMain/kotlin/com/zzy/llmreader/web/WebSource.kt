@@ -74,26 +74,7 @@ abstract class HtmlWebSource : WebSource {
     protected open val extraHeaders: Map<String, String> = emptyMap()
 
     private val client: OkHttpClient by lazy {
-        val browserSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
-            .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
-            .cipherSuites(
-                CipherSuite.TLS_AES_128_GCM_SHA256,
-                CipherSuite.TLS_AES_256_GCM_SHA384,
-                CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-                CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-                CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-                CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-                CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-                CipherSuite.TLS_RSA_WITH_AES_128_GCM_SHA256,
-                CipherSuite.TLS_RSA_WITH_AES_256_GCM_SHA384,
-                CipherSuite.TLS_RSA_WITH_AES_128_CBC_SHA,
-                CipherSuite.TLS_RSA_WITH_AES_256_CBC_SHA,
-            )
-            .build()
+        val browserSpec = browserConnectionSpec()
         OkHttpClient.Builder()
             .connectionSpecs(listOf(browserSpec, ConnectionSpec.COMPATIBLE_TLS, ConnectionSpec.CLEARTEXT))
             .protocols(listOf(Protocol.HTTP_1_1))
@@ -318,3 +299,36 @@ abstract class HtmlWebSource : WebSource {
         }
     }
 }
+
+    /**
+ * 站点连接允许的 TLS 版本。
+ *
+ * ⚠️ **TLS 1.2 不能删**。本工程已移除 Conscrypt（四个 ABI 原生库占了 APK 的 80%），
+ * Android 7~9（API 24~28）没有 TLS 1.3，只能靠这条回退：
+ * OkHttp 的 ConnectionSpec.apply 会把这里声明的协议与**平台实际支持的**取交集，
+ * 老设备上交集就只剩 TLS 1.2。删掉它那些设备会直接连不上站点。
+ * 有单元测试锁住这个不变量（DesktopTlsConfigTest）。
+ */
+internal val BROWSER_TLS_VERSIONS = arrayOf(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
+
+/** 站点连接使用的 ConnectionSpec（协议清单见 [BROWSER_TLS_VERSIONS]）。 */
+internal fun browserConnectionSpec(): ConnectionSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+    .tlsVersions(*BROWSER_TLS_VERSIONS)
+    .cipherSuites(
+            CipherSuite.TLS_AES_128_GCM_SHA256,
+            CipherSuite.TLS_AES_256_GCM_SHA384,
+            CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+            CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+            CipherSuite.TLS_RSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_RSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite.TLS_RSA_WITH_AES_128_CBC_SHA,
+            CipherSuite.TLS_RSA_WITH_AES_256_CBC_SHA,
+        )
+        .build()
