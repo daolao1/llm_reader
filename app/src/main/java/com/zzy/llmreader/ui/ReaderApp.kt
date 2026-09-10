@@ -114,6 +114,8 @@ import com.zzy.llmreader.ui.reader.generateImage
 import com.zzy.llmreader.ui.reader.generateInlineImage
 import com.zzy.llmreader.ui.reader.imageFilePath
 import com.zzy.llmreader.ui.reader.refreshChapterImages
+import com.zzy.llmreader.ui.reader.openDiscoveryItem
+import com.zzy.llmreader.ui.reader.retryChapterTranslation
 import com.zzy.llmreader.ui.reader.saveCharacterLibrary
 import com.zzy.llmreader.ui.reader.saveImageGenSettings
 

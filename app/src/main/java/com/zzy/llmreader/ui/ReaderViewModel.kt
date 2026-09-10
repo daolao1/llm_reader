@@ -15,7 +15,15 @@ import com.zzy.llmreader.data.RecentBookSource
 import com.zzy.llmreader.data.ReadingTheme
 import com.zzy.llmreader.data.TranslationMode
 import com.zzy.llmreader.format.AndroidBookSource
+import com.zzy.llmreader.ui.reader.BookJob
+import com.zzy.llmreader.ui.reader.runDiscovery
+import com.zzy.llmreader.ui.reader.refreshBookFromCache
+import com.zzy.llmreader.ui.reader.ensureChapterTranslated
 import com.zzy.llmreader.ui.reader.refreshChapterImages
+import com.zzy.llmreader.ui.reader.applyTagsForItem
+import com.zzy.llmreader.ui.reader.translateBookInfosOnce
+import com.zzy.llmreader.ui.reader.translateDiscoveryBatch
+import com.zzy.llmreader.ui.reader.translateTagsOnce
 import com.zzy.llmreader.llm.ChapterTranslator
 import com.zzy.llmreader.llm.ChatMessage
 import com.zzy.llmreader.model.BookContent
@@ -52,41 +60,41 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     private val progressRepo = core.progressRepo
 
     /** 当前已打开书的进度键（web 用 canonical url；本地用文件 uri）。 */
-    private var currentBookKey: String? = null
+    internal var currentBookKey: String? = null
 
     /** 每章翻译协程的 Job，切书/关书时用于取消旧书的翻译，避免结果串到新书上。 */
-    private val translationJobs = mutableMapOf<Int, kotlinx.coroutines.Job>()
+    internal val translationJobs = mutableMapOf<Int, kotlinx.coroutines.Job>()
 
     private fun cancelAllTranslationJobs() {
         translationJobs.values.forEach { it.cancel() }
         translationJobs.clear()
     }
     internal val client = core.llmClient
-    private val translator = core.translator
+    internal val translator = core.translator
     private val parser = core.documentParser
-    private val webCache = core.webCache
+    internal val webCache = core.webCache
 
     /** Tag 翻译缓存：key = "lang|tag-原文" → 译文。启动时从 DataStore 加载。 */
-    private val tagTranslationCache: LinkedHashMap<String, String> = LinkedHashMap()
+    internal val tagTranslationCache: LinkedHashMap<String, String> = LinkedHashMap()
 
     /** 书籍信息（标题+简介）翻译缓存：key = "lang|title|||summary" → (译标题, 译简介)。 */
-    private val bookInfoTranslationCache: LinkedHashMap<String, Pair<String, String>> = LinkedHashMap()
+    internal val bookInfoTranslationCache: LinkedHashMap<String, Pair<String, String>> = LinkedHashMap()
 
-    private val discoveryTxRepo = core.discoveryTxRepo
-    private val localGlossary = core.localGlossary
-    private val webRegistry = core.createWebRegistry { _state.value.readerPrefs }
+    internal val discoveryTxRepo = core.discoveryTxRepo
+    internal val localGlossary = core.localGlossary
+    internal val webRegistry = core.createWebRegistry { _state.value.readerPrefs }
     internal val imageGenRepo = core.imageGenRepo
     internal val characterRepo = core.characterRepo
     internal val imageCache = core.imageCache
     internal val novelAi = core.novelAi
     internal val comfyUi = core.comfyUi
     /** 序列化"读缓存→改→写缓存"，避免懒加载和预取互相覆盖。 */
-    private val cacheMutex = Mutex()
+    internal val cacheMutex = Mutex()
 
     /** CF 拦截后保留的待重试上下文：拿到 cookie 后自动重做这步动作。 */
     private var pendingWebBookOpen: String? = null
     private var pendingChapterReload: Int? = null
-    private var pendingDiscoveryReload: Boolean = false
+    internal var pendingDiscoveryReload: Boolean = false
     /** 详情页选中的章节：openBook/openWebBook 完成后跳到该章。 */
     private var pendingInitialChapter: Int? = null
 
@@ -100,7 +108,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     /** \u542f\u52a8\u65f6\u4e00\u6b21\u6027\u52a0\u8f7d\u53d1\u73b0\u9875\u7ffb\u8bd1\u7f13\u5b58\u7684 Job\uff1b\u7ffb\u8bd1\u524d\u5148 join \u7b49\u5b83\u5c31\u7eea\u3002 */
-    private var discoveryCacheLoad: kotlinx.coroutines.Job? = null
+    internal var discoveryCacheLoad: kotlinx.coroutines.Job? = null
 
     init {
         viewModelScope.launch {
@@ -1014,150 +1022,9 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         translateDiscoveryBatch(_state.value.discovery.items)
     }
 
-    /**
-     * 批量翻译当前结果（标题+简介一次、tag 一次，两个接口并发）。
-     * 命中缓存的不会重复请求；未命中的拼成一份提示一并发出去。
-     */
-    private fun translateDiscoveryBatch(items: List<com.zzy.llmreader.web.DiscoveryItem>) {
-        if (items.isEmpty()) return
-        // 启动后第一次走到这儿时缓存可能还没加载完——先等它，再读缓存。
-        viewModelScope.launch {
-            runCatching { discoveryCacheLoad?.join() }
-            translateDiscoveryBatchInternal(items)
-        }
-    }
 
-    private fun translateDiscoveryBatchInternal(items: List<com.zzy.llmreader.web.DiscoveryItem>) {
-        val settings = _state.value.settings
-        if (settings.apiKey.isBlank()) {
-            _state.update {
-                it.copy(discovery = it.discovery.copy(error = "未配置 LLM API Key，无法翻译"))
-            }
-            return
-        }
-        val target = _state.value.readerPrefs.translationLanguage
-        val style = _state.value.readerPrefs.translationStyle
 
-        // ---- 准备 book info 待译列表 ----
-        val pendingBooks = items.mapNotNull { item ->
-            if (!item.translatedTitle.isNullOrBlank() &&
-                (item.summary.isNullOrBlank() || !item.translatedSummary.isNullOrBlank())
-            ) return@mapNotNull null
-            // 原文已是目标语言（如中文）时不请求翻译。
-            val summary = item.summary
-            if (looksLikeTargetLanguage(item.title, target) &&
-                (summary.isNullOrBlank() || looksLikeTargetLanguage(summary, target))
-            ) return@mapNotNull null
-            val key = bookInfoCacheKey(target, item.title, item.summary.orEmpty())
-            bookInfoTranslationCache[key]?.let { (t, s) ->
-                applyBookInfoTranslation(item.id, t, s)
-                return@mapNotNull null
-            }
-            BookJob(item.id, item.title, item.summary?.take(800).orEmpty())
-        }
-
-        // ---- 准备 tag 待译列表 ----
-        val allTags = items.flatMap { it.tags }.distinct().filter { it.isNotBlank() }
-        val pendingTags = allTags.filter {
-            tagTranslationCache["$target|$it"] == null && !looksLikeTargetLanguage(it, target)
-        }
-        // 命中缓存的 tag 立刻应用一次，UI 立即出译文。
-        applyCachedTagTranslations(target)
-
-        if (pendingBooks.isEmpty() && pendingTags.isEmpty()) return
-
-        val markIds = (pendingBooks.map { it.id } +
-            items.filter { it.tags.any { tag -> tag in pendingTags } }.map { it.id }).toSet()
-        _state.update {
-            it.copy(discovery = it.discovery.copy(translating = it.discovery.translating + markIds))
-        }
-
-        viewModelScope.launch {
-            val bookJob = if (pendingBooks.isNotEmpty()) {
-                async {
-                    runCatching {
-                        translateBookInfosOnce(settings, target, style, pendingBooks)
-                    }.onFailure {
-                        android.util.Log.w("ReaderVM", "translate book infos failed", it)
-                    }.getOrElse { e ->
-                        _state.update { st ->
-                            st.copy(discovery = st.discovery.copy(
-                                error = "书籍信息翻译失败：${e.message ?: e.javaClass.simpleName}",
-                            ))
-                        }
-                        emptyMap()
-                    }
-                }
-            } else null
-            val tagJob = if (pendingTags.isNotEmpty()) {
-                async {
-                    runCatching {
-                        translateTagsOnce(settings, target, pendingTags)
-                    }.onFailure {
-                        android.util.Log.w("ReaderVM", "translate tags failed", it)
-                    }.getOrElse { e ->
-                        _state.update { st ->
-                            st.copy(discovery = st.discovery.copy(
-                                error = "标签翻译失败：${e.message ?: e.javaClass.simpleName}",
-                            ))
-                        }
-                        emptyMap()
-                    }
-                }
-            } else null
-            val bookResults = bookJob?.await().orEmpty()
-            val tagResults = tagJob?.await().orEmpty()
-            android.util.Log.i(
-                "ReaderVM",
-                "discovery batch translate: books=${pendingBooks.size}->${bookResults.size}, " +
-                    "tags=${pendingTags.size}->${tagResults.size}",
-            )
-
-            // 写缓存
-            for ((id, pair) in bookResults) {
-                val item = items.firstOrNull { it.id == id } ?: continue
-                bookInfoTranslationCache[bookInfoCacheKey(target, item.title, item.summary.orEmpty())] = pair
-            }
-            for ((tag, tx) in tagResults) {
-                if (tx.isNotBlank()) tagTranslationCache["$target|$tag"] = tx
-            }
-            // 落盘（异常吞掉，不影响 UI）
-            if (bookResults.isNotEmpty()) {
-                runCatching { discoveryTxRepo.saveBooks(bookInfoTranslationCache) }
-                    .onFailure { android.util.Log.w("ReaderVM", "save book tx cache failed", it) }
-            }
-            if (tagResults.isNotEmpty()) {
-                runCatching { discoveryTxRepo.saveTags(tagTranslationCache) }
-                    .onFailure { android.util.Log.w("ReaderVM", "save tag tx cache failed", it) }
-            }
-
-            // 应用到 state
-            _state.update { st ->
-                val d = st.discovery
-                val newItems = d.items.map { i ->
-                    val newTitleSummary = bookResults[i.id]
-                    val newTags = applyTagsForItem(i, target)
-                    i.copy(
-                        translatedTitle = newTitleSummary?.first?.takeIf { it.isNotBlank() }
-                            ?: i.translatedTitle,
-                        translatedSummary = newTitleSummary?.second?.takeIf { it.isNotBlank() }
-                            ?: i.translatedSummary,
-                        translatedTags = newTags ?: i.translatedTags,
-                    )
-                }
-                st.copy(
-                    discovery = d.copy(
-                        items = newItems,
-                        translating = d.translating - markIds,
-                    ),
-                )
-            }
-        }
-    }
-
-    private data class BookJob(val id: String, val title: String, val summary: String)
-
-    private fun bookInfoCacheKey(lang: String, title: String, summary: String): String =
+    internal fun bookInfoCacheKey(lang: String, title: String, summary: String): String =
         "$lang|$title|||${summary.take(800)}"
 
     /**
@@ -1176,7 +1043,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
             u.contains("pixiv.net") || u.contains("alphapolis.co.jp")
     }
 
-    private fun looksLikeTargetLanguage(text: String, target: String): Boolean {
+    internal fun looksLikeTargetLanguage(text: String, target: String): Boolean {
         if (text.isBlank()) return true
         val tgt = target.lowercase()
         val isChineseTarget = tgt.contains("中文") || tgt.contains("简体") ||
@@ -1195,491 +1062,22 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         return cjk >= 2
     }
 
-    /** 把已缓存的 tag 翻译写到当前列表里（无网络请求）。 */
-    private fun applyCachedTagTranslations(target: String) {
-        _state.update { st ->
-            val d = st.discovery
-            val items = d.items.map { i ->
-                val newTags = applyTagsForItem(i, target)
-                if (newTags == null) i else i.copy(translatedTags = newTags)
-            }
-            st.copy(discovery = d.copy(items = items))
-        }
-    }
 
-    /** 用缓存表给一个 item 拼出 translatedTags，全空则返回 null（保持原值）。 */
-    private fun applyTagsForItem(
-        i: com.zzy.llmreader.web.DiscoveryItem,
-        target: String,
-    ): List<String>? {
-        if (i.tags.isEmpty()) return null
-        val translated = i.tags.map { tag -> tagTranslationCache["$target|$tag"].orEmpty() }
-        return if (translated.any { it.isNotBlank() }) translated else null
-    }
 
-    private fun applyBookInfoTranslation(itemId: String, title: String, summary: String) {
-        _state.update { st ->
-            val d = st.discovery
-            val items = d.items.map { i ->
-                if (i.id != itemId) i else i.copy(
-                    translatedTitle = title.ifBlank { i.translatedTitle },
-                    translatedSummary = summary.ifBlank { i.translatedSummary },
-                )
-            }
-            st.copy(discovery = d.copy(items = items))
-        }
-    }
 
-    /** 一次性把多本书的标题+简介丢给 LLM。返回 itemId → (译标题, 译简介)。
-     *  现在采用：拆成多个小块并发 + 流式返回。每一本在流中解析出来后就立即更新 UI，
-     *  不用等一整批都拿回才出译文。什么本都是独立请求，某本失败不会拖累其他本。。
-     *  若一整批被服务端过滤（HTTP 500 "Response got filtered" 等），自动二分降级递归，
-     *  让"干净"的部分仍能翻成功，单条仍失败就跳过。 */
-    private suspend fun translateBookInfosOnce(
-        settings: com.zzy.llmreader.data.LlmSettings,
-        target: String,
-        style: String,
-        jobs: List<BookJob>,
-    ): Map<String, Pair<String, String>> {
-        if (jobs.isEmpty()) return emptyMap()
-        val chunkSize = 3
-        val chunks = jobs.chunked(chunkSize)
-        // 限制并发：同一时刻最多 2 个 LLM 流式请求，避免被网关限流。
-        val sem = Semaphore(2)
-        return kotlinx.coroutines.coroutineScope {
-            chunks.map { chunk ->
-                async {
-                    sem.withPermit { translateBookInfosChunkSafe(settings, target, style, chunk) }
-                }
-            }.awaitAll().fold(LinkedHashMap<String, Pair<String, String>>()) { acc, m -> acc.putAll(m); acc }
-        }
-    }
 
-    /** 单个块，带过滤重试二分。 */
-    private suspend fun translateBookInfosChunkSafe(
-        settings: com.zzy.llmreader.data.LlmSettings,
-        target: String,
-        style: String,
-        jobs: List<BookJob>,
-    ): Map<String, Pair<String, String>> {
-        if (jobs.isEmpty()) return emptyMap()
-        val result = runCatching { translateBookInfosChunkStream(settings, target, style, jobs) }
-        result.exceptionOrNull()?.let { e ->
-            val msg = e.message.orEmpty()
-            val filtered = msg.contains("filtered", ignoreCase = true) ||
-                msg.contains("HTTP 500") ||
-                msg.contains("content_policy", ignoreCase = true) ||
-                msg.contains("safety", ignoreCase = true)
-            if (!filtered || jobs.size <= 1) {
-                if (jobs.size == 1) {
-                    android.util.Log.w("ReaderVM", "translateBookInfos chunk single skipped: ${jobs[0].title}")
-                    return emptyMap()
-                }
-                throw e
-            }
-            android.util.Log.w("ReaderVM", "translateBookInfos chunk filtered, split ${jobs.size} -> ${jobs.size / 2}+${jobs.size - jobs.size / 2}")
-            val mid = jobs.size / 2
-            val left = translateBookInfosChunkSafe(settings, target, style, jobs.subList(0, mid))
-            val right = translateBookInfosChunkSafe(settings, target, style, jobs.subList(mid, jobs.size))
-            return left + right
-        }
-        return result.getOrDefault(emptyMap())
-    }
 
-    /** 流式拿一个块的译文，每解析出一本就立即 applyBookInfoTranslation。 */
-    private suspend fun translateBookInfosChunkStream(
-        settings: com.zzy.llmreader.data.LlmSettings,
-        target: String,
-        style: String,
-        jobs: List<BookJob>,
-    ): Map<String, Pair<String, String>> {
-        val (jbTop, jbBottom) = translator.jailbreakPair(settings)
-        val sys = buildString {
-            if (jbTop.isNotEmpty()) append(jbTop).append("\n\n")
-            append("你是小说库 app 的书目翻译引擎，把下面 N 本书的标题和简介完整、忠实、一对一地翻译为").append(target).append("。")
-            append("保留原意与原文强度，不扩写、不删减、不软化；原文中如出现成人/暴力/敏感题材，也需原强度译出，不得跳过。")
-            if (style.isNotBlank()) append(" 风格：").append(style).append("。")
-            append(
-                "\n严格按下列格式输出，不要 markdown / 说明 / 思考过程：\n" +
-                    "INDEX: <编号>\nTITLE: <译后标题>\nSUMMARY: <译后简介，单行；如原文无简介则写「无」>\n\n每本书一组，组与组之间用空行分隔。",
-            )
-        }
-        val userBody = buildString {
-            jobs.forEachIndexed { idx, j ->
-                if (idx > 0) append("\n\n")
-                append("INDEX: ").append(idx + 1).append('\n')
-                append("TITLE_RAW: ").append(j.title).append('\n')
-                append("SUMMARY_RAW: ").append(j.summary.ifBlank { "无" })
-            }
-            if (jbBottom.isNotEmpty()) append("\n\n").append(jbBottom)
-        }
-        val buffer = StringBuilder()
-        val emitted = mutableSetOf<Int>()
-        val out = mutableMapOf<String, Pair<String, String>>()
-        // 匹配一个完整记录：INDEX:n / TITLE:.. / SUMMARY:.. ，后跟空行或下一个 INDEX。
-        val recordRe = Regex(
-            "INDEX:\\s*(\\d+)\\s*\\n+TITLE:\\s*([^\\n]*)\\n+SUMMARY:\\s*([^\\n]*)(?=\\n)",
-            RegexOption.IGNORE_CASE,
-        )
-        fun flush() {
-            val text = buffer.toString()
-            for (m in recordRe.findAll(text)) {
-                val idx1 = m.groupValues[1].toIntOrNull() ?: continue
-                val zero = idx1 - 1
-                if (zero in emitted) continue
-                val j = jobs.getOrNull(zero) ?: continue
-                val title = m.groupValues[2].trim()
-                var summary = m.groupValues[3].trim()
-                if (summary.equals("无", ignoreCase = true)) summary = ""
-                applyBookInfoTranslation(j.id, title, summary)
-                out[j.id] = title to summary
-                emitted += zero
-                // 同时落缓存，避免套中间进程被中断后下次重复请求。
-                bookInfoTranslationCache[bookInfoCacheKey(target, j.title, j.summary)] = title to summary
-            }
-        }
-        val full = client.chatStream(
-            settings,
-            listOf(
-                com.zzy.llmreader.llm.ChatMessage(role = "system", content = sys),
-                com.zzy.llmreader.llm.ChatMessage(role = "user", content = userBody),
-            ),
-            forceMinimalReasoning = true,
-        ) { delta ->
-            buffer.append(delta)
-            flush()
-        }.getOrElse { throw it }
-        // 流结束后再走一次传统 parser，兼容最后一本未以 \n 结尾。
-        if (emitted.size < jobs.size) {
-            val parsed = parseBatchTitleSummary(full)
-            for ((idx1, pair) in parsed) {
-                val zero = idx1 - 1
-                if (zero in emitted) continue
-                val j = jobs.getOrNull(zero) ?: continue
-                val title = pair.first
-                val summary = pair.second
-                applyBookInfoTranslation(j.id, title, summary)
-                out[j.id] = title to summary
-                emitted += zero
-                bookInfoTranslationCache[bookInfoCacheKey(target, j.title, j.summary)] = title to summary
-            }
-        }
-        if (out.isEmpty()) {
-            android.util.Log.w("ReaderVM", "translateBookInfosChunkStream empty parse, raw=${full.take(500)}")
-        }
-        return out
-    }
 
-    private suspend fun translateBookInfosBatch(
-        settings: com.zzy.llmreader.data.LlmSettings,
-        target: String,
-        style: String,
-        jobs: List<BookJob>,
-    ): Map<String, Pair<String, String>> = translateBookInfosChunkStream(settings, target, style, jobs)
 
-    /** 翻译一批 tag。按 12 个一组切块，最多 3 个并发。整组被过滤则二分降级。 */
-    private suspend fun translateTagsOnce(
-        settings: com.zzy.llmreader.data.LlmSettings,
-        target: String,
-        tags: List<String>,
-    ): Map<String, String> {
-        if (tags.isEmpty()) return emptyMap()
-        val chunks = tags.chunked(12)
-        val sem = Semaphore(3)
-        return kotlinx.coroutines.coroutineScope {
-            chunks.map { chunk ->
-                async {
-                    sem.withPermit { translateTagsChunkSafe(settings, target, chunk) }
-                }
-            }.awaitAll().fold(LinkedHashMap<String, String>()) { acc, m ->
-                // 单组完成立刻把结果写进缓存并刷新 UI，让翻译"流式"出现。
-                for ((k, v) in m) {
-                    if (v.isNotBlank()) tagTranslationCache["$target|$k"] = v
-                }
-                applyCachedTagTranslations(target)
-                acc.putAll(m); acc
-            }
-        }
-    }
 
-    /** 单组 tag 翻译，遇过滤则二分。 */
-    private suspend fun translateTagsChunkSafe(
-        settings: com.zzy.llmreader.data.LlmSettings,
-        target: String,
-        tags: List<String>,
-    ): Map<String, String> {
-        if (tags.isEmpty()) return emptyMap()
-        val result = runCatching { translateTagsBatch(settings, target, tags) }
-        result.exceptionOrNull()?.let { e ->
-            val msg = e.message.orEmpty()
-            val filtered = msg.contains("filtered", ignoreCase = true) ||
-                msg.contains("HTTP 500") ||
-                msg.contains("content_policy", ignoreCase = true) ||
-                msg.contains("safety", ignoreCase = true)
-            if (!filtered || tags.size <= 1) {
-                if (tags.size == 1) {
-                    android.util.Log.w("ReaderVM", "translateTagsOnce single skipped: ${tags[0]}")
-                    return emptyMap()
-                }
-                throw e
-            }
-            android.util.Log.w("ReaderVM", "translateTagsOnce filtered, split ${tags.size} -> ${tags.size / 2}+${tags.size - tags.size / 2}")
-            val mid = tags.size / 2
-            val left = translateTagsChunkSafe(settings, target, tags.subList(0, mid))
-            val right = translateTagsChunkSafe(settings, target, tags.subList(mid, tags.size))
-            return left + right
-        }
-        return result.getOrDefault(emptyMap())
-    }
 
-    private suspend fun translateTagsBatch(
-        settings: com.zzy.llmreader.data.LlmSettings,
-        target: String,
-        tags: List<String>,
-    ): Map<String, String> {
-        val (jbTop, jbBottom) = translator.jailbreakPair(settings)
-        val sys = buildString {
-            if (jbTop.isNotEmpty()) append(jbTop).append("\n\n")
-            append("你是小说库 app 的分类标签翻译引擎，把下列编号标签逐个翻译为").append(target).append("。")
-            append("译文需简洁（≤6 字），保留原意；成人/敏感/口语标签也需原强度译出，不得跳过、不得拒给。")
-            append(
-                "\n严格按下列格式输出，一行一个，不要 markdown / 说明 / 思考过程：\n" +
-                    "<编号>. <译文>",
-            )
-        }
-        val userBody = buildString {
-            append(tags.mapIndexed { i, t -> "${i + 1}. $t" }.joinToString("\n"))
-            if (jbBottom.isNotEmpty()) append("\n\n").append(jbBottom)
-        }
-        val res = client.chat(
-            settings,
-            listOf(
-                com.zzy.llmreader.llm.ChatMessage(role = "system", content = sys),
-                com.zzy.llmreader.llm.ChatMessage(role = "user", content = userBody),
-            ),
-            forceMinimalReasoning = true,
-        ).getOrElse {
-            android.util.Log.w("ReaderVM", "translateTagsOnce chat error", it)
-            throw it
-        }
-        val out = mutableMapOf<String, String>()
-        val numRe = Regex("^\\s*(\\d+)[\\.|、)]\\s*(.+)$")
-        for (line in res.lineSequence()) {
-            val m = numRe.find(line) ?: continue
-            val idx = m.groupValues[1].toIntOrNull() ?: continue
-            val tx = m.groupValues[2].trim().trim('"', '\'')
-            val src = tags.getOrNull(idx - 1) ?: continue
-            if (tx.isNotBlank()) out[src] = tx
-        }
-        if (out.isEmpty()) {
-            android.util.Log.w("ReaderVM", "translateTagsOnce empty parse, raw=${res.take(500)}")
-        }
-        return out
-    }
 
-    private fun parseBatchTitleSummary(text: String): Map<Int, Pair<String, String>> {
-        val out = mutableMapOf<Int, Pair<String, String>>()
-        var idx: Int? = null
-        var title = ""
-        var summary = ""
-        fun flush() {
-            val i = idx ?: return
-            if (title.isNotBlank() || summary.isNotBlank()) {
-                val s = if (summary.equals("无", ignoreCase = true)) "" else summary
-                out[i] = title to s
-            }
-            idx = null; title = ""; summary = ""
-        }
-        for (raw in text.lineSequence()) {
-            val line = raw.trim()
-            when {
-                line.startsWith("INDEX:", ignoreCase = true) -> {
-                    flush()
-                    idx = line.substringAfter(":").trim().toIntOrNull()
-                }
-                line.startsWith("TITLE:", ignoreCase = true) ->
-                    title = line.substringAfter(":").trim()
-                line.startsWith("SUMMARY:", ignoreCase = true) ->
-                    summary = line.substringAfter(":").trim()
-            }
-        }
-        flush()
-        return out
-    }
 
-    private fun runDiscovery(resetPage: Boolean) {
-        val cur = _state.value.discovery
-        val site = cur.siteId?.let { webRegistry.findById(it) } ?: return
-        val discovery = site.discovery ?: return
-        val caps = discovery.capabilities
-        val query = if (resetPage) {
-            cur.query.copy(page = caps.firstPage)
-        } else {
-            cur.query.copy(page = cur.query.page + 1)
-        }
-        // 关键字必填的站点（如 Pixiv）：没有 keyword 也没有 tag 时才给空态；
-        // 只有 tag 时用第一个 tag 临时作为站点 keyword，再做本地 tag 过滤。
-        if (caps.keywordRequired && query.keyword.trim().isEmpty() && query.tags.none { it.isNotBlank() }) {
-            _state.update {
-                it.copy(
-                    discovery = it.discovery.copy(
-                        query = query,
-                        loading = false,
-                        error = null,
-                        items = emptyList(),
-                        hasMore = false,
-                        totalCount = null,
-                    ),
-                )
-            }
-            return
-        }
-        _state.update {
-            it.copy(
-                discovery = it.discovery.copy(
-                    query = query,
-                    loading = true,
-                    error = null,
-                    items = if (resetPage) emptyList() else it.discovery.items,
-                ),
-            )
-        }
-        viewModelScope.launch {
-            val result = runCatching {
-                if (query.tags.any { it.isNotBlank() }) {
-                    val fetchQuery = query.withKeywordsIncludingTags()
-                    discoverWithLocalTagFill(discovery, fetchQuery, query)
-                } else {
-                    discovery.discover(query)
-                }
-            }
-            result.fold(
-                onSuccess = { page ->
-                    _state.update {
-                        val merged = if (resetPage) page.items else it.discovery.items + page.items
-                        it.copy(
-                            discovery = it.discovery.copy(
-                                query = page.query,
-                                items = merged,
-                                hasMore = page.hasMore,
-                                totalCount = page.totalCount,
-                                loading = false,
-                            ),
-                        )
-                    }
-                    if (_state.value.discovery.translateListings) {
-                        translateDiscoveryBatch(page.items)
-                    }
-                },
-                onFailure = { t ->
-                    if (t is CloudflareBlockedException) {
-                        pendingDiscoveryReload = true
-                        _state.update {
-                            it.copy(
-                                discovery = it.discovery.copy(
-                                    loading = false,
-                                    error = "需要重新通过 Cloudflare 验证。",
-                                ),
-                                error = "需要重新通过 Cloudflare 验证。",
-                                pendingCloudflareUrl = t.targetUrl,
-                            )
-                        }
-                    } else {
-                        _state.update {
-                            it.copy(
-                                discovery = it.discovery.copy(
-                                    loading = false,
-                                    error = t.message ?: t.javaClass.simpleName,
-                                ),
-                            )
-                        }
-                    }
-                },
-            )
-        }
-    }
 
-    private suspend fun discoverWithLocalTagFill(
-        discovery: com.zzy.llmreader.web.WebDiscovery,
-        fetchQuery: com.zzy.llmreader.web.DiscoveryQuery,
-        displayQuery: com.zzy.llmreader.web.DiscoveryQuery,
-    ): com.zzy.llmreader.web.DiscoveryPage {
-        val targetSize = displayQuery.pageSize.coerceAtLeast(1)
-        val matched = mutableListOf<com.zzy.llmreader.web.DiscoveryItem>()
-        var nextQuery = fetchQuery
-        var lastQuery = fetchQuery
-        var hasMore = true
-        var totalCount: Long? = null
-        var guard = 0
 
-        while (matched.size < targetSize && hasMore && guard < 20) {
-            guard += 1
-            val page = discovery.discover(nextQuery)
-            lastQuery = page.query
-            totalCount = page.totalCount
-            matched += page.items.filter { it.matchesAllLocalTags(displayQuery.tags) }
-            hasMore = page.hasMore
-            if (matched.size < targetSize && hasMore) {
-                nextQuery = page.query.copy(page = page.query.page + 1)
-            }
-        }
 
-        return com.zzy.llmreader.web.DiscoveryPage(
-            query = displayQuery.copy(page = lastQuery.page),
-            items = matched,
-            hasMore = hasMore,
-            totalCount = totalCount,
-        )
-    }
 
-    private fun com.zzy.llmreader.web.DiscoveryQuery.withKeywordsIncludingTags():
-        com.zzy.llmreader.web.DiscoveryQuery {
-        val terms = (keyword.split(Regex("[\\s　]+")) + tags)
-            .map { it.trim().trimStart('#').trim() }
-            .filter { it.isNotBlank() }
-            .distinctBy { it.lowercase(java.util.Locale.ROOT) }
-        return copy(keyword = terms.joinToString(" "))
-    }
 
-    private fun com.zzy.llmreader.web.DiscoveryItem.matchesAllLocalTags(tags: List<String>): Boolean {
-        val wanted = tags.mapNotNull { it.normalizedDiscoveryTag().takeIf(String::isNotBlank) }
-        if (wanted.isEmpty()) return true
-        val haystack = this.tags.map { it.normalizedDiscoveryTag() }
-        return wanted.all { needle ->
-            haystack.any { candidate -> candidate == needle || candidate.contains(needle) }
-        }
-    }
-
-    private fun String.normalizedDiscoveryTag(): String =
-        trim().trimStart('#').trim().lowercase(java.util.Locale.ROOT)
-
-    /** 选中某条 item → 走正常的"网页书"打开流程。 */
-    fun openDiscoveryItem(itemId: String) {
-        val cur = _state.value.discovery
-        val site = cur.siteId?.let { webRegistry.findById(it) } ?: return
-        val discovery = site.discovery ?: return
-        // 列表里没有时回退到详情弹窗当前的相似作品分组（站点原生推荐结果）。
-        val item = cur.items.firstOrNull { it.id == itemId }
-            ?: cur.detailSimilarGroups?.asSequence()
-                ?.flatMap { it.items.asSequence() }
-                ?.firstOrNull { it.id == itemId }
-            ?: return
-        // 关闭详情弹窗（如果是从详情按"开始阅读"进来的）
-        _state.update {
-            it.copy(
-                discovery = it.discovery.copy(
-                    detailItemId = null,
-                    detailSimilarGroups = null,
-                    detailSimilarLoading = false,
-                ),
-            )
-        }
-        viewModelScope.launch {
-            val resolved = runCatching { discovery.resolveDetailUrl(item) }.getOrNull()
-                ?: item.detailUrl
-            openWebBook(resolved)
-        }
-    }
 
 
     /** UI 触发 CF 验证 Activity 后调用，把 cookie 落盘并自动重试上次失败的操作。 */
@@ -1874,403 +1272,16 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         saveReaderPrefs(cur.readerPrefs.copy(readingTheme = next))
     }
 
-    /**
-     * 翻译指定章节。已翻译且语言匹配则跳过；否则调用 LLM 流式翻译并写回缓存。
-     * 支持任意来源的书（网页 / 本地 EPUB / TXT）：网页书额外持久化到磁盘。
-     */
-    fun ensureChapterTranslated(index: Int) {
-        val cur = _state.value
-        val book = cur.book as? BookContent.Text ?: return
-        if (index !in book.chapters.indices) return
-        if (index in cur.translatingChapters) return
-        if (book.chapters[index].translatedContent != null) return // 已翻译，直接复用
 
-        val bookKey = currentBookKey // 发起翻译时的书身份，回调落地前用于校验书没被切换
-        val canonical = cur.webCanonicalUrl // 可能为 null（本地书）
-        val targetLang = cur.readerPrefs.translationLanguage
-        val chapter = book.chapters[index]
-        val original = chapter.content
-        if (original == null) {
-            // 网页书章节正文还没下载，先下载
-            ensureChapterLoaded(index)
-            translationJobs[index] = viewModelScope.launch {
-                repeat(40) {
-                    if (bookKey != currentBookKey) return@launch
-                    val updated = (_state.value.book as? BookContent.Text)
-                        ?.chapters?.getOrNull(index)?.content
-                    if (updated != null) {
-                        ensureChapterTranslated(index)
-                        return@launch
-                    }
-                    kotlinx.coroutines.delay(500)
-                }
-            }
-            return
-        }
 
-        // 清掉之前的失败记录
-        _state.update {
-            it.copy(
-                translatingChapters = it.translatingChapters + index,
-                translationProgress = "翻译准备中…",
-                failedTranslations = it.failedTranslations - index,
-            )
-        }
 
-        translationJobs[index] = viewModelScope.launch {
-            val settings = settingsRepo.settings.first()
-            if (settings.apiKey.isBlank()) {
-                markTranslationFailed(bookKey, index, "尚未配置 API Key，请到设置里填写")
-                return@launch
-            }
-
-            // 拿到原文 HTML：网页书从缓存读取（保留 <p> 结构）；本地书用 Spanned 转 HTML
-            val originalHtml: String
-            val originalTitle: String
-            if (canonical != null) {
-                val placeholder = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                    ?.chapters?.getOrNull(index)
-                if (placeholder?.html == null) {
-                    markTranslationFailed(bookKey, index, "原文 HTML 缺失，请重新打开本章")
-                    return@launch
-                }
-                // 同语言已翻译则跳过
-                if (placeholder.translatedHtml != null && placeholder.translationLanguage == targetLang) {
-                    refreshBookFromCache(canonical)
-                    _state.update {
-                        it.copy(
-                            translatingChapters = it.translatingChapters - index,
-                            translationProgress = null,
-                        )
-                    }
-                    return@launch
-                }
-                originalHtml = placeholder.html.orEmpty()
-                originalTitle = placeholder.title
-            } else {
-                // 本地书的正文本来就是 HTML 字符串，直接用
-                originalHtml = chapter.content.orEmpty()
-                originalTitle = chapter.title
-            }
-
-            // 原文已经是目标语言（如简体中文 + 中文文章）→ 不发 LLM，直接把原文当译文用。
-            if (looksLikeTargetLanguage(originalTitle, targetLang) &&
-                looksLikeTargetLanguage(stripHtml(originalHtml), targetLang)
-            ) {
-                if (canonical != null) {
-                    cacheMutex.withLock {
-                        val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                        if (cached != null) {
-                            val updated = cached.copy(
-                                chapters = cached.chapters.toMutableList().apply {
-                                    val ch = this.getOrNull(index) ?: return@apply
-                                    this[index] = ch.copy(
-                                        translatedHtml = ch.html,
-                                        translatedTitle = ch.title,
-                                        translationLanguage = targetLang,
-                                    )
-                                },
-                            )
-                            withContext(Dispatchers.IO) { webCache.write(updated) }
-                        }
-                    }
-                    refreshBookFromCache(canonical)
-                } else {
-                    // 本地书：直接把原文塞到 translatedContent
-                    _state.update { st ->
-                        val b = st.book as? BookContent.Text ?: return@update st
-                        val newChapters = b.chapters.toMutableList().also {
-                            val ch = it[index]
-                            it[index] = ch.copy(
-                                translatedTitle = ch.title,
-                                translatedContent = ch.content,
-                            )
-                        }
-                        st.copy(book = b.copy(chapters = newChapters))
-                    }
-                }
-                _state.update {
-                    it.copy(
-                        translatingChapters = it.translatingChapters - index,
-                        translationProgress = null,
-                    )
-                }
-                android.util.Log.i("ReaderVM", "chapter $index already in target language, skip translate")
-                return@launch
-            }
-
-            // 流式更新节流：避免每个 token 都触发整章重排
-            val partialState = PartialBuffer()
-
-            val styleHint = _state.value.readerPrefs.translationStyle
-            val dedupeInterval = _state.value.readerPrefs.glossaryDedupeInterval
-            val glossaryMaxSize = _state.value.readerPrefs.glossaryMaxSize
-            var batchCounter = 0
-
-            // 跨章节上下文：取上一章末尾几段译文（仅当上一章已翻译且语言匹配）
-            val initialContext: String? = if (canonical != null && index > 0) {
-                val prev = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                    ?.chapters?.getOrNull(index - 1)
-                val prevTranslated = prev?.translatedHtml
-                if (prevTranslated != null && prev.translationLanguage == targetLang) {
-                    translator.extractTailContext(prevTranslated).takeIf { it.isNotBlank() }
-                } else null
-            } else null
-
-            val result = translator.translate(
-                settings = settings,
-                targetLanguage = targetLang,
-                chapterTitle = originalTitle,
-                chapterHtml = originalHtml,
-                styleHint = styleHint,
-                initialPreviousContext = initialContext,
-                inlineImagesPerChapter = if (_state.value.imageGenSettings.enableInlineImages) {
-                    _state.value.imageGenSettings.inlineImagesPerChapter
-                } else 0,
-                batchChars = _state.value.readerPrefs.translationBatchChars,
-                glossaryProvider = {
-                    // 每批翻译前动态读取最新术语表（网页书 → cache，本地书 → 本地存储）
-                    val entries = if (canonical != null) {
-                        withContext(Dispatchers.IO) { webCache.read(canonical) }?.glossary ?: emptyList()
-                    } else {
-                        val key = _state.value.book?.title.orEmpty()
-                        if (key.isBlank()) emptyList()
-                        else withContext(Dispatchers.IO) { localGlossary.read(key) }
-                    }
-                    entries.joinToString("\n") { "${it.original} → ${it.translated}" }
-                },
-                onProgress = { current, total ->
-                    _state.update { it.copy(translationProgress = "翻译中 $current/$total") }
-                },
-                onPartial = { partialTitle, partialHtml ->
-                    if (partialState.shouldFlush()) {
-                        applyPartialTranslation(bookKey, index, partialTitle, partialHtml)
-                    }
-                },
-                onBatchTranslated = { batchOriginal, batchTranslated ->
-                    batchCounter++
-                    val localKey: String? = if (canonical == null) _state.value.book?.title?.takeIf { it.isNotBlank() } else null
-                    if (canonical != null) {
-                        val now = System.currentTimeMillis()
-                        val batchText = batchOriginal.joinToString(" ")
-
-                        // 1) LRU：刷新出现在本批原文中的术语的 lastUsed
-                        runCatching {
-                            cacheMutex.withLock {
-                                val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                                    ?: return@withLock
-                                var touched = false
-                                val refreshed = cached.glossary.map { entry ->
-                                    if (batchText.contains(entry.original)) {
-                                        touched = true
-                                        entry.copy(lastUsed = now)
-                                    } else entry
-                                }
-                                if (touched) {
-                                    val updated = cached.copy(glossary = refreshed)
-                                    withContext(Dispatchers.IO) { webCache.write(updated) }
-                                }
-                            }
-                        }
-
-                        // 2) 提取新术语并合并
-                        runCatching {
-                            val extracted = translator.extractGlossary(
-                                settings, targetLang,
-                                batchOriginal.joinToString("\n") { "<p>$it</p>" },
-                                batchTranslated.joinToString("\n") { "<p>$it</p>" },
-                            )
-                            if (extracted.isNotBlank()) {
-                                val newEntries = parseGlossaryText(extracted)
-                                if (newEntries.isNotEmpty()) {
-                                    cacheMutex.withLock {
-                                        val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                                            ?: return@withLock
-                                        val existing = cached.glossary
-                                        val existingKeys = existing.map { it.original }.toSet()
-                                        val merged = existing + newEntries.filter { it.original !in existingKeys }
-                                        // LRU 淘汰：超过上限时按 lastUsed 从旧到新排序，保留最新的
-                                        val trimmed = if (merged.size > glossaryMaxSize) {
-                                            merged.sortedByDescending { it.lastUsed }.take(glossaryMaxSize)
-                                        } else merged
-                                        if (trimmed != existing) {
-                                            val updated = cached.copy(glossary = trimmed)
-                                            withContext(Dispatchers.IO) { webCache.write(updated) }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 3) 每 N 批做一次 LLM 智能去重
-                        if (dedupeInterval > 0 && batchCounter % dedupeInterval == 0) {
-                            runCatching {
-                                val current = withContext(Dispatchers.IO) { webCache.read(canonical) }?.glossary ?: emptyList()
-                                if (current.size > 3) {
-                                    val glossaryText = current.joinToString("\n") { "${it.original} → ${it.translated}" }
-                                    val deduped = translator.deduplicateGlossary(settings, glossaryText)
-                                    if (deduped.isNotBlank()) {
-                                        val dedupedEntries = parseGlossaryText(deduped)
-                                        if (dedupedEntries.isNotEmpty()) {
-                                            cacheMutex.withLock {
-                                                val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                                                    ?: return@withLock
-                                                val updated = cached.copy(glossary = dedupedEntries)
-                                                withContext(Dispatchers.IO) { webCache.write(updated) }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if (localKey != null) {
-                        // 本地书：抽取新术语并合并到本地存储
-                        runCatching {
-                            val extracted = translator.extractGlossary(
-                                settings, targetLang,
-                                batchOriginal.joinToString("\n") { "<p>$it</p>" },
-                                batchTranslated.joinToString("\n") { "<p>$it</p>" },
-                            )
-                            if (extracted.isNotBlank()) {
-                                val newEntries = parseGlossaryText(extracted)
-                                if (newEntries.isNotEmpty()) {
-                                    val existing = withContext(Dispatchers.IO) { localGlossary.read(localKey) }
-                                    val existingKeys = existing.map { it.original }.toSet()
-                                    val merged = existing + newEntries.filter { it.original !in existingKeys }
-                                    val trimmed = if (merged.size > glossaryMaxSize) {
-                                        merged.sortedByDescending { it.lastUsed }.take(glossaryMaxSize)
-                                    } else merged
-                                    if (trimmed != existing) {
-                                        withContext(Dispatchers.IO) { localGlossary.write(localKey, trimmed) }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-            )
-
-            when (result) {
-                is ChapterTranslator.TranslateResult.Success -> {
-                    // 写回内存
-                    applyPartialTranslation(bookKey, index, result.translatedTitle, result.html)
-                    // 网页书 → 同时持久化到磁盘
-                    if (canonical != null) {
-                        cacheMutex.withLock {
-                            val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                                ?: return@withLock
-                            val chapters = cached.chapters.toMutableList()
-                            chapters[index] = chapters[index].copy(
-                                translatedHtml = result.html,
-                                translatedTitle = result.translatedTitle,
-                                translationLanguage = targetLang,
-                            )
-                            val updated = cached.copy(chapters = chapters)
-                            withContext(Dispatchers.IO) { webCache.write(updated) }
-                        }
-                    }
-                    _state.update {
-                        it.copy(
-                            translatingChapters = it.translatingChapters - index,
-                            translationProgress = null,
-                            failedTranslations = it.failedTranslations - index,
-                        )
-                    }
-                }
-                is ChapterTranslator.TranslateResult.Failure -> {
-                    markTranslationFailed(bookKey, index, result.message)
-                }
-            }
-        }
-    }
-
-    /** 用户在 UI 上点"重试"时调用：清掉失败记录 + 已翻译标记，重新触发翻译。 */
-    fun retryChapterTranslation(index: Int) {
-        val cur = _state.value
-        val book = cur.book as? BookContent.Text ?: return
-        if (index !in book.chapters.indices) return
-        // 清掉内存中已写入的部分译文，让 ensureChapterTranslated 重新跑
-        val chapters = book.chapters.toMutableList()
-        chapters[index] = chapters[index].copy(
-            translatedTitle = null,
-            translatedContent = null,
-        )
-        _state.update {
-            it.copy(
-                book = BookContent.Text(book.title, chapters),
-                failedTranslations = it.failedTranslations - index,
-                translatingChapters = it.translatingChapters - index,
-            )
-        }
-        ensureChapterTranslated(index)
-    }
-
-    /** [bookKey] 是发起翻译时的 currentBookKey；书已切换/关闭则丢弃这次回调，避免串书。 */
-    private fun markTranslationFailed(bookKey: String?, index: Int, message: String) {
-        if (bookKey != currentBookKey) return
-        _state.update {
-            it.copy(
-                translatingChapters = it.translatingChapters - index,
-                translationProgress = null,
-                failedTranslations = it.failedTranslations + (index to message),
-                error = message,
-            )
-        }
-    }
-
-    /** [bookKey] 是发起翻译时的 currentBookKey；书已切换/关闭则丢弃这次回调，避免串书。 */
-    private fun applyPartialTranslation(bookKey: String?, index: Int, title: String?, html: String) {
-        if (bookKey != currentBookKey) return
-        _state.update { state ->
-            val book = state.book as? BookContent.Text ?: return@update state
-            if (index !in book.chapters.indices) return@update state
-            val chapters = book.chapters.toMutableList()
-            val cur = chapters[index]
-            chapters[index] = cur.copy(
-                translatedTitle = title?.takeIf { it.isNotBlank() } ?: cur.translatedTitle,
-                translatedContent = if (html.isNotBlank()) html else cur.translatedContent,
-            )
-            state.copy(book = BookContent.Text(book.title, chapters))
-        }
-    }
 
     /** 粗略剥离 HTML 标签，仅供语言检测使用，最长截 4000 字符够判断。 */
-    private fun stripHtml(html: String): String =
+    internal fun stripHtml(html: String): String =
         html.replace(Regex("<[^>]+>"), " ").take(4000)
 
     /** 节流：每 250ms 至多 flush 一次部分译文到 UI。 */
-    private class PartialBuffer {
-        private var lastFlushAt = 0L
-        fun shouldFlush(): Boolean {
-            val now = System.currentTimeMillis()
-            return if (now - lastFlushAt > 250) {
-                lastFlushAt = now
-                true
-            } else false
-        }
-    }
 
-    private suspend fun refreshBookFromCache(canonical: String) {
-        val cached = withContext(Dispatchers.IO) { webCache.read(canonical) } ?: return
-        _state.update { state ->
-            var next = state
-            if (state.webCanonicalUrl == canonical) {
-                next = next.copy(book = cached.toBookContent())
-            }
-            // 详情页同样持有目录的译名快照——目录翻译落盘后也要同步给它，
-            // 否则 BookDetailScreen 的章节列表不会显示译名。
-            val d = next.bookDetail
-            if (d != null && (d.key == canonical || d.detailUrl == canonical)) {
-                next = next.copy(
-                    bookDetail = d.copy(
-                        chapters = cached.chapters.map { it.title },
-                        translatedChapters = cached.chapters.map { it.translatedTitle },
-                    ),
-                )
-            }
-            next
-        }
-    }
 
     private val tocTranslateInFlight = mutableSetOf<String>()
 
@@ -2534,7 +1545,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 解析 LLM 返回的"原文 → 译文"文本为结构化列表。 */
-    private fun parseGlossaryText(text: String): List<com.zzy.llmreader.web.GlossaryEntry> {
+    internal fun parseGlossaryText(text: String): List<com.zzy.llmreader.web.GlossaryEntry> {
         return text.lines()
             .map { it.trim() }
             .filter { it.contains("→") || it.contains("->") || it.contains("=>") }
@@ -2668,4 +1679,3 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         internal const val TAG = "ReaderVM"
     }
 }
-
