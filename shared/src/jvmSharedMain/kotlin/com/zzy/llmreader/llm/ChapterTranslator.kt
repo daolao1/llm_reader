@@ -96,6 +96,22 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
         }
         if (failure != null) return TranslateResult.Failure(failure!!)
 
+        // 「一段都没翻出来」必须判失败。
+        //
+        // 逐段回退成原文的逻辑在上面（`?: batch[i]`）是必要的保底，但如果没有这道检查，
+        // 模型拒答 / 只吐散文 / 服务端未按 SSE 返回时，每一段都会落到原文，函数却照常
+        // 返回 Success —— 调用方会把「原文」当作「译文」写进缓存并打上 translationLanguage，
+        // 该章此后被判定为已翻译、再也不会重试，而界面上没有任何报错。
+        val untranslatedCount = paragraphs.indices.count { translatedParagraphs[it] == paragraphs[it] }
+        if (untranslatedCount == paragraphs.size) {
+            return TranslateResult.Failure(
+                "模型没有返回可用的译文（${paragraphs.size} 段全部原样返回）。" +
+                    "常见原因：模型拒绝翻译、返回了纯文本说明而非 [编号] 译文、" +
+                    "或服务端没有按 SSE 返回数据流。" +
+                    "若原文本身已是目标语言，请检查设置里的目标语言是否正确。",
+            )
+        }
+
         return TranslateResult.Success(
             translatedTitle = translatedTitle,
             html = buildHtml(translatedParagraphs, paragraphs),

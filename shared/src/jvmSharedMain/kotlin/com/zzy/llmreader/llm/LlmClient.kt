@@ -113,16 +113,24 @@ class LlmClient {
                 }
                 val source = resp.body?.source() ?: error("空响应")
                 val full = StringBuilder()
+                // 统计「看起来像 SSE 但都解析失败」的行，用于失败时给出更准的原因
+                var dataLines = 0
+                var unparsableLines = 0
                 while (!source.exhausted()) {
                     val line = source.readUtf8Line() ?: break
                     if (line.isBlank()) continue
                     if (!line.startsWith("data:")) continue
                     val data = line.removePrefix("data:").trim()
                     if (data == "[DONE]") break
+                    dataLines++
                     val parsedDelta = runCatching {
                         json.decodeFromString(StreamChunk.serializer(), data)
                             .choices.firstOrNull()?.delta
-                    }.getOrNull() ?: continue
+                    }.getOrNull()
+                    if (parsedDelta == null) {
+                        unparsableLines++
+                        continue
+                    }
                     // 忽略 reasoning_content / reasoning 思维链字段（DeepSeek-R1 / OpenAI o1 / 部分 Gemini 代理会输出）。
                     val delta = parsedDelta.content.orEmpty()
                     if (delta.isNotEmpty()) {
@@ -130,7 +138,27 @@ class LlmClient {
                         onDelta(delta)
                     }
                 }
-                full.toString()
+                val text = full.toString()
+                // ⚠️ 必须在这里判失败。
+                // 旧实现无条件 `return full.toString()`：网关忽略 stream=true 直接返回
+                // 普通 JSON 时，整个响应体没有一行以 `data:` 开头，于是这里返回**空串且
+                // 判定为成功**。上层 ChapterTranslator 收到空串后逐段回退成原文、仍然返回
+                // Success，最终把「日文原文」当作「简体中文译文」永久写进缓存 ——
+                // 章节被标记为已翻译，此后再也不会重试，界面上也没有任何报错。
+                if (text.isEmpty()) {
+                    error(
+                        when {
+                            dataLines == 0 ->
+                                "服务端没有返回 SSE 数据流（可能忽略了 stream=true，" +
+                                    "或该地址不是 OpenAI 兼容的 /chat/completions 接口）"
+                            unparsableLines == dataLines ->
+                                "SSE 数据流全部无法解析（服务端可能在流内返回了错误，或返回了非标准格式）"
+                            else ->
+                                "模型返回了空内容（delta 里没有 content，可能只有思维链或触发了内容过滤）"
+                        },
+                    )
+                }
+                text
             }
         }
     }
