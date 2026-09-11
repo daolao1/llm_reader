@@ -130,7 +130,45 @@ extractParagraphs(html)                Jsoup 解析，取出 <p> 段落
 
 ---
 
-## 6. 调用方约定
+## 6. ⚠️ SSE 会把 `[N]` 标记拆到两个 delta 里
+
+增量解析器的标记扫描起点**必须回退一个"标记可能的最大长度"**，不能直接用本轮新增文本的起点。
+
+```
+append#1: delta=[1    从 from=0 搜 -> 未命中   ← '[' 已进 buffer
+append#2: delta=]     从 from=2 搜 -> 未命中   ← '[' 在 index 0，被永久跳过
+append#11: delta=[2   从 from=19 搜 -> 未命中  ← 同一个错误重复
+```
+
+`[12]` 会被 SSE 拆成 `[1`（上一轮）和 `2] `（这一轮）。若从本轮起点往后搜，`[` 落在已经
+扫描过的区间里，标记**永远匹配不到**：`current` 始终为 -1 → `emit()` 从不执行 →
+`onPartial()` 一次都不发。
+
+### 为什么这个 bug 特别隐蔽
+
+收尾的 `finish()` 走**全量重扫**，所以**最终译文完全正确**——它不以"译文错误"的形式暴露，
+只让"边翻边看"静默消失。表现是整章只在结尾一次性出现，而所有非流式的测试全绿。
+
+实测就是这样坏掉的：8 秒的流式响应，`onPartial` 只触发 **1 次**（批末那一次）。
+
+### 正确写法
+
+```kotlin
+// 扫描起点回退 MAX_MARKER_CHARS（14 = '[' + 10 位数字 + ']' + 空白）
+val searchFrom = minOf(scanLimit, maxOf(0, from - MAX_MARKER_CHARS))
+```
+
+回退扫是安全的：`lastMarkerEnd` 只会因**发现新标记**而推进，已扫描过的区间不会重复上报。
+
+### 测试上的坑
+
+**桩服务端必须真的慢**（每个 delta 之间 sleep）。若服务端瞬时返回，250ms 节流会把所有中间
+推送都吞掉、只剩批末那一次——那样即使解析器坏了也测不出来。最初的测试版本正是因此漏掉了它。
+见 `shared/src/desktopTest/.../StreamingTimelineTest.kt`。
+
+---
+
+## 7. 调用方约定
 
 - **`translateStreaming`**：生产路径（App 两端都用它）。接受 `concurrency`，
   结果经 `onFinish` 交还 —— 中间态走 `onPartial`，最终态走 `onFinish`，两者都不会漏。

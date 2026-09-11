@@ -413,7 +413,10 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
 
         private val buffer = StringBuilder()
         private val text = arrayOfNulls<String>(expected)
+        /** 已确认归属的文本上界：下一段文本从它之后开始（单调推进，保证不重复上报）。 */
         private var lastMarkerEnd = -1
+        /** 下一次扫描标记的起点下界：不能超过 [lastMarkerEnd]，否则会重复处理同一个标记。 */
+        private var scanLimit = 0
         private var current = -1
 
         /** 处理新增的 [delta]，返回**内容发生变化**的段落（下标 0 基）。 */
@@ -421,9 +424,21 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
             val from = buffer.length
             buffer.append(delta)
             val completed = ArrayList<Pair<Int, String>>(2)
-            var searchFrom = from
+
+            // ⚠️ 搜索起点必须回退一个"标记可能的最大长度"，不能直接用本轮新增的起点 [from]。
+            //
+            // SSE 会把 `[12]` 拆到两个 delta 里（`[1` + `2] `）。若从 from 往后搜，
+            // 开头的 `[` 落在上一轮、`]` 落在这一轮，标记就**永远匹配不到** ——
+            // 表现是 current 始终为 -1、emit 从不执行、onPartial 一次都不发，
+            // 也就是"边翻边看"静默失效（而 finish() 走全量重扫，最终译文看起来完全正常，
+            // 所以这个 bug 不会以译文错误的形式暴露）。实测就是这么坏掉的。
+            //
+            // 回退扫是安全的：[lastMarkerEnd] 只会因**发现新标记**而推进，
+            // 已扫描过的区间不会重复产生上报。
+            val searchFrom = minOf(scanLimit, maxOf(0, from - MAX_MARKER_CHARS))
+            var cursor = searchFrom
             while (true) {
-                val m = MARKER_RE.find(buffer, searchFrom) ?: break
+                val m = MARKER_RE.find(buffer, cursor) ?: break
                 // 新标记出现 → 它之前的内容归属"上一个标记的编号"
                 if (lastMarkerEnd >= 0 && current in 0 until expected) {
                     emit(completed, current, lastMarkerEnd, m.range.first)
@@ -433,7 +448,8 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
                 // 否则下一轮会把同一段重复归属到上一个有效编号。
                 current = if (idx != null && idx in 0 until expected) idx else -1
                 lastMarkerEnd = m.range.last + 1
-                searchFrom = m.range.last + 1
+                scanLimit = m.range.last + 1
+                cursor = m.range.last + 1
             }
             // 当前（尚未闭合的）段落：模型还在往里吐字，已能渲染的部分照样推给调用方
             if (lastMarkerEnd >= 0 && current in 0 until expected && buffer.length > lastMarkerEnd) {
@@ -482,6 +498,9 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
 
         companion object {
             private val MARKER_RE = Regex("""\[(\d+)\]\s*""")
+
+            /** `[N] ` 标记可能的最大长度：`[` + 10 位数字 + `]` + 空白。 */
+            const val MAX_MARKER_CHARS = 14
         }
     }
 
