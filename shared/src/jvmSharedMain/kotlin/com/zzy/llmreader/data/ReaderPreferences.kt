@@ -54,6 +54,14 @@ data class ReaderPreferences(
     val glossaryMaxSize: Int = DEFAULT_GLOSSARY_MAX_SIZE,
     /** 翻译时每批最大字符数（按段落整段聚合，不切句）。越大整章请求次数越少，但单次输出越长越易截断。 */
     val translationBatchChars: Int = DEFAULT_TRANSLATION_BATCH_CHARS,
+    /**
+     * 同时有多少个批次请求在途（1 = 完全串行）。
+     *
+     * 默认 1：一个 API Key 是否允许并发、以及限流额度，只有用户自己知道，所以不替用户
+     * 做主。>1 时第 k 批只需等第 (k - concurrency + 1) 批翻完，用"前文译文取自更早一批"
+     * 换取真实并行（实测 4 批 / 3 路并发端到端 852ms → 422ms）。
+     */
+    val translationConcurrency: Int = DEFAULT_TRANSLATION_CONCURRENCY,
     /** Pixiv 登录 cookie（PHPSESSID），为空时只能拉取全年龄小说。 */
     val pixivPhpSessId: String = "",
     /** Hameln (syosetu.org) 可选 cookie：如被 Cloudflare 拦截时粘贴 cf_clearance 等。 */
@@ -80,6 +88,10 @@ data class ReaderPreferences(
         const val DEFAULT_TRANSLATION_BATCH_CHARS = 4000
         const val MIN_TRANSLATION_BATCH_CHARS = 500
         const val MAX_TRANSLATION_BATCH_CHARS = 12000
+        /** 保守默认：串行。并发会同时向同一个 API 地址发多个请求。 */
+        const val DEFAULT_TRANSLATION_CONCURRENCY = 1
+        /** 与 ChapterTranslator.MAX_TRANSLATION_CONCURRENCY 保持一致。 */
+        const val MAX_TRANSLATION_CONCURRENCY = 4
     }
 }
 
@@ -95,6 +107,7 @@ class ReaderPreferencesRepository(private val store: DataStore<Preferences>) {
     private val keyGlossaryDedupe = intPreferencesKey("glossary_dedupe_interval")
     private val keyGlossaryMaxSize = intPreferencesKey("glossary_max_size")
     private val keyBatchChars = intPreferencesKey("translation_batch_chars")
+    private val keyConcurrency = intPreferencesKey("translation_concurrency")
     private val keyPixivCookie = stringPreferencesKey("pixiv_phpsessid")
     private val keyHamelnCookie = stringPreferencesKey("hameln_cookie")
     private val keyHamelnUserAgent = stringPreferencesKey("hameln_user_agent")
@@ -134,6 +147,9 @@ class ReaderPreferencesRepository(private val store: DataStore<Preferences>) {
                     ReaderPreferences.MIN_TRANSLATION_BATCH_CHARS,
                     ReaderPreferences.MAX_TRANSLATION_BATCH_CHARS,
                 ),
+            translationConcurrency = (prefs[keyConcurrency]
+                ?: ReaderPreferences.DEFAULT_TRANSLATION_CONCURRENCY)
+                .coerceIn(1, ReaderPreferences.MAX_TRANSLATION_CONCURRENCY),
             pixivPhpSessId = prefs[keyPixivCookie].orEmpty(),
             hamelnCookie = prefs[keyHamelnCookie].orEmpty(),
             hamelnUserAgent = prefs[keyHamelnUserAgent].orEmpty(),
@@ -164,6 +180,8 @@ class ReaderPreferencesRepository(private val store: DataStore<Preferences>) {
                     ReaderPreferences.MIN_TRANSLATION_BATCH_CHARS,
                     ReaderPreferences.MAX_TRANSLATION_BATCH_CHARS,
                 )
+            p[keyConcurrency] = prefs.translationConcurrency
+                .coerceIn(1, ReaderPreferences.MAX_TRANSLATION_CONCURRENCY)
             p[keyPixivCookie] = prefs.pixivPhpSessId.trim()
             p[keyHamelnCookie] = prefs.hamelnCookie.trim()
             p[keyHamelnUserAgent] = prefs.hamelnUserAgent.trim()

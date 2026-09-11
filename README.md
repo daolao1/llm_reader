@@ -25,6 +25,9 @@ OkHttp · Jsoup · kotlinx.serialization · DataStore · Coil · Markwon
 - 跨章节术语表（人名、专有名词）自动积累，支持手动编辑与智能去重
 - 网页书译文落盘缓存，重开不必重翻
 - 提示词针对 DeepSeek / Gemini 等分别调优，并刻意保持 system prompt 稳定以命中 provider 的 prompt cache
+- 可选并发：同时在途的批次请求数 1–4（默认 1 = 串行）。默认保守是因为并发额度只有用户自己知道；
+  调到 3 时实测整章耗时约减半，代价是"前文译文"取自更早一批，指代衔接略弱于串行。详见
+  [docs/TRANSLATION-PIPELINE.md](docs/TRANSLATION-PIPELINE.md)
 
 **发现页**（Android 已实现）
 - 图书馆式浏览 8 个站点：关键字搜索、多维过滤、排序、相似作品、作者同作品

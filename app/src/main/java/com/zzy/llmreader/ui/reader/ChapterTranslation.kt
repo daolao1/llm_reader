@@ -170,7 +170,7 @@ import kotlinx.coroutines.withContext
                 } else null
             } else null
 
-            val result = translator.translate(
+            translator.translateStreaming(
                 settings = settings,
                 targetLanguage = targetLang,
                 chapterTitle = originalTitle,
@@ -181,6 +181,7 @@ import kotlinx.coroutines.withContext
                     _state.value.imageGenSettings.inlineImagesPerChapter
                 } else 0,
                 batchChars = _state.value.readerPrefs.translationBatchChars,
+                concurrency = _state.value.readerPrefs.translationConcurrency,
                 glossaryProvider = {
                     // 每批翻译前动态读取最新术语表（网页书 → cache，本地书 → 本地存储）
                     val entries = if (canonical != null) {
@@ -301,39 +302,40 @@ import kotlinx.coroutines.withContext
                         }
                     }
                 },
-            )
-
-            when (result) {
-                is ChapterTranslator.TranslateResult.Success -> {
-                    // 写回内存
-                    applyPartialTranslation(bookKey, index, result.translatedTitle, result.html)
-                    // 网页书 → 同时持久化到磁盘
-                    if (canonical != null) {
-                        cacheMutex.withLock {
-                            val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
-                                ?: return@withLock
-                            val chapters = cached.chapters.toMutableList()
-                            chapters[index] = chapters[index].copy(
-                                translatedHtml = result.html,
-                                translatedTitle = result.translatedTitle,
-                                translationLanguage = targetLang,
-                            )
-                            val updated = cached.copy(chapters = chapters)
-                            withContext(Dispatchers.IO) { webCache.write(updated) }
+                onFinish = { result ->
+                    when (result) {
+                        is ChapterTranslator.TranslateResult.Success -> {
+                            // 写回内存
+                            applyPartialTranslation(bookKey, index, result.translatedTitle, result.html)
+                            // 网页书 → 同时持久化到磁盘
+                            if (canonical != null) {
+                                cacheMutex.withLock {
+                                    val cached = withContext(Dispatchers.IO) { webCache.read(canonical) }
+                                        ?: return@withLock
+                                    val chapters = cached.chapters.toMutableList()
+                                    chapters[index] = chapters[index].copy(
+                                        translatedHtml = result.html,
+                                        translatedTitle = result.translatedTitle,
+                                        translationLanguage = targetLang,
+                                    )
+                                    val updated = cached.copy(chapters = chapters)
+                                    withContext(Dispatchers.IO) { webCache.write(updated) }
+                                }
+                            }
+                            _state.update {
+                                it.copy(
+                                    translatingChapters = it.translatingChapters - index,
+                                    translationProgress = null,
+                                    failedTranslations = it.failedTranslations - index,
+                                )
+                            }
+                        }
+                        is ChapterTranslator.TranslateResult.Failure -> {
+                            markTranslationFailed(bookKey, index, result.message)
                         }
                     }
-                    _state.update {
-                        it.copy(
-                            translatingChapters = it.translatingChapters - index,
-                            translationProgress = null,
-                            failedTranslations = it.failedTranslations - index,
-                        )
-                    }
-                }
-                is ChapterTranslator.TranslateResult.Failure -> {
-                    markTranslationFailed(bookKey, index, result.message)
-                }
-            }
+                },
+            )
         }
     }
 

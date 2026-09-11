@@ -1,6 +1,14 @@
 package com.zzy.llmreader.llm
 
 import com.zzy.llmreader.data.LlmSettings
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 
 /**
@@ -10,8 +18,17 @@ import org.jsoup.Jsoup
  * - 解析 HTML 为段落（<p>），保留分段结构；
  * - 用编号的"段落清单"喂给模型，要求严格按 `[N]` 编号回填译文，
  *   这样即使有段落漏译也能精确对位；
- * - 每批最多 ~3000 字（按"段落"分批，不切句），分批顺序请求避免一次性超 token；
+ * - 每批最多 ~3000 字（按"段落"分批，不切句），分批请求避免一次性超 token；
  * - 拼回 HTML 时用 `<p>` 包装，简单稳健。
+ *
+ * 速度设计（改动时请保持这几条不变量）：
+ * - **流式回调不得是 O(章节长度)**：SSE 的每个 delta 都在读取循环里同步回调，
+ *   回调里做全量重解析 / 重建整章字符串会按 O(n²) 累积，实测一章能吃掉数秒并构造 GB 级垃圾。
+ *   因此解析走 [IncrementalNumberedParser]（只处理新增文本），HTML 走 [IncrementalHtmlBuilder]
+ *   （每段只 escape 一次），并且只在段落内容真的变化时才向下推。
+ * - **标题与首批并发**：串行实现里标题那一轮往返会把首屏译文推迟一整个 RTT。
+ * - **并发批次仍保上下文**：第 k 批必须等第 k-1 批完成，保证它的"前文译文"是真实的
+ *   上一批译文而非猜测；[concurrency] 只决定同时有几次请求在途（见 [translateWindowed]）。
  */
 class ChapterTranslator(private val client: LlmClient = LlmClient()) {
 
@@ -31,99 +48,486 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
         onProgress: (current: Int, total: Int) -> Unit = { _, _ -> },
         onPartial: (translatedTitle: String?, html: String) -> Unit = { _, _ -> },
         onBatchTranslated: suspend (batchOriginal: List<String>, batchTranslated: List<String>) -> Unit = { _, _ -> },
+    ): TranslateResult = translateStreaming(        settings = settings,
+        targetLanguage = targetLanguage,
+        chapterTitle = chapterTitle,
+        chapterHtml = chapterHtml,
+        styleHint = styleHint,
+        glossaryProvider = glossaryProvider,
+        initialPreviousContext = initialPreviousContext,
+        inlineImagesPerChapter = inlineImagesPerChapter,
+        batchChars = batchChars,
+        concurrency = 1,
+        onProgress = onProgress,
+        onPartial = onPartial,
+        onBatchTranslated = onBatchTranslated,
+        onFinish = {},
+    )
+
+    /**
+     * 翻译一章，并把结果通过 [onFinish] 交还调用方（成功或失败都调用一次）。
+     *
+     * 与 [translate] 的区别：结果不在协程内部直接 return，而是作为一次回调交还 ——
+     * 便于调用方在拿到最终结果时做落盘等副作用，而中间态通过 [onPartial] 流出。
+     *
+     * [concurrency] 为在途请求上限（1 = 完全串行，与旧行为一致）。>1 时第 k 批仍要等
+     * 第 k-1 批翻完才发请求（`previousContext` 必须是真实的上一批译文），所以它提速的是
+     * "等模型吐字"的时间，而不是牺牲上下文质量。上限受 [MAX_TRANSLATION_CONCURRENCY] 约束。
+     */
+    suspend fun translateStreaming(
+        settings: LlmSettings,
+        targetLanguage: String,
+        chapterTitle: String,
+        chapterHtml: String,
+        styleHint: String = "",
+        glossaryProvider: suspend () -> String = { "" },
+        initialPreviousContext: String? = null,
+        inlineImagesPerChapter: Int = 0,
+        batchChars: Int = MAX_BATCH_CHARS,
+        concurrency: Int = 1,
+        onProgress: (current: Int, total: Int) -> Unit = { _, _ -> },
+        onPartial: (translatedTitle: String?, html: String) -> Unit = { _, _ -> },
+        onBatchTranslated: suspend (batchOriginal: List<String>, batchTranslated: List<String>) -> Unit = { _, _ -> },
+        onFinish: suspend (TranslateResult) -> Unit,
     ): TranslateResult {
         val paragraphs = extractParagraphs(chapterHtml)
         if (paragraphs.isEmpty()) {
-            return TranslateResult.Failure("正文为空，无法翻译")
+            val empty = TranslateResult.Failure("正文为空，无法翻译")
+            onFinish(empty)
+            return empty
         }
         val batches = batchParagraphs(paragraphs, batchChars.coerceAtLeast(200))
         // 按章判定一次原文是否日文，保证整章 system prompt 稳定（不破坏 prompt cache）
         val sourceIsJapanese = containsJapaneseKana(paragraphs.take(10).joinToString("\n"))
-        val total = batches.size + 1 // +1 是标题翻译
+        val window = concurrency.coerceIn(1, MAX_TRANSLATION_CONCURRENCY)
+        // +1 是标题翻译。标题与首批并发，进度按批推进。
+        val total = batches.size + 1
         onProgress(0, total)
-
-        // 1) 翻译标题（流式，让标题立刻出现）
-        val translatedTitle = runCatching {
-            translateTitleStream(settings, targetLanguage, chapterTitle, glossaryProvider()) { partialTitle ->
-                onPartial(partialTitle, "")
-            }
-        }.getOrElse { return TranslateResult.Failure("标题翻译失败：${it.message}") }
-        onProgress(1, total)
-        onPartial(translatedTitle, "")
-
-        // 2) 分批翻译段落（流式，每收到一段译文就推一次部分 HTML）
         val translatedParagraphs = MutableList(paragraphs.size) { "" }
-        // 全局段落游标：当前批的第 0 段 → translatedParagraphs[batchOffset]
-        var globalOffset = 0
-        var failure: String? = null
-        // 上一批的译文末尾几段，作为下一批的上下文参考（保持语气一致）
-        var previousContext: String? = initialPreviousContext
-        for ((batchIdx, batch) in batches.withIndex()) {
-            // 每批翻译前重新获取最新术语表，并只注入本批原文/前文译文命中的条目（省 token、提升遵从度）
-            val currentGlossary = filterGlossaryForBatch(
-                glossaryProvider(),
-                batchOriginalText = batch.joinToString("\n"),
-                previousTranslatedText = previousContext.orEmpty(),
+        // 逐段缓存 escape 结果并增量拼接整章 HTML：每个 delta 的代价与"新增字符数"成正比，
+        // 而不是与"整章长度"成正比。
+        val htmlBuilder = IncrementalHtmlBuilder(paragraphs)
+
+        val result = try {
+            translateWindowed(
+                settings = settings,
+                targetLanguage = targetLanguage,
+                chapterTitle = chapterTitle,
+                paragraphs = paragraphs,
+                batches = batches,
+                initialPreviousContext = initialPreviousContext,
+                styleHint = styleHint,
+                inlineImagesPerChapter = inlineImagesPerChapter,
+                sourceIsJapanese = sourceIsJapanese,
+                glossaryProvider = glossaryProvider,
+                window = window,
+                translatedParagraphs = translatedParagraphs,
+                htmlBuilder = htmlBuilder,
+                onProgress = onProgress,
+                onPartial = onPartial,
+                onBatchTranslated = onBatchTranslated,
+                total = total,
             )
-            val resultRes = runCatching {
-                translateBatchStream(settings, targetLanguage, batch, previousContext, styleHint, currentGlossary, inlineImagesPerChapter, sourceIsJapanese) { localIdx, partial ->
-                    val gIdx = globalOffset + localIdx
-                    if (gIdx in translatedParagraphs.indices) {
-                        translatedParagraphs[gIdx] = partial
-                        onPartial(translatedTitle, buildHtml(translatedParagraphs, paragraphs))
+        } catch (e: BatchFailed) {
+            TranslateResult.Failure(e.message.orEmpty())
+        }
+        onFinish(result)
+        return result
+    }
+
+    /**
+     * 批次调度：滑动窗口发请求 + 单协程按序收割。
+     *
+     * 两个不变量：
+     * 1. **第 k 批必须等第 k-1 批翻完**才发请求（[gates]）—— `previousContext` 只能是真实的
+     *    上一批译文，不允许用原文或更早批次的译文凑数，否则指代与称谓会前后不一致。
+     *    [window] 因此只决定"同时有几次请求在途"，不改变每批看到的内容。
+     * 2. **收割在单一协程里按批序进行** —— 调用方的 [onBatchTranslated] 与 [onPartial]
+     *    因此永远串行、且按批顺序被调用，调用方不需要考虑线程安全（与旧的串行实现一致）。
+     */
+    private suspend fun translateWindowed(
+        settings: LlmSettings,
+        targetLanguage: String,
+        chapterTitle: String,
+        paragraphs: List<String>,
+        batches: List<List<String>>,
+        initialPreviousContext: String?,
+        styleHint: String,
+        inlineImagesPerChapter: Int,
+        sourceIsJapanese: Boolean,
+        glossaryProvider: suspend () -> String,
+        window: Int,
+        translatedParagraphs: MutableList<String>,
+        htmlBuilder: IncrementalHtmlBuilder,
+        onProgress: (current: Int, total: Int) -> Unit,
+        onPartial: (translatedTitle: String?, html: String) -> Unit,
+        onBatchTranslated: suspend (batchOriginal: List<String>, batchTranslated: List<String>) -> Unit,
+        total: Int,
+    ): TranslateResult = coroutineScope {
+        // 标题与首批段落并发：旧实现串行时，标题那一轮往返会把首屏译文整体推迟一个 RTT。
+        // 它只用于 onPartial 的标题字段，因此未完成时取 null 即可，绝不阻塞段落流式输出。
+        val titleJob = async { translateTitleResilient(settings, targetLanguage, chapterTitle, glossaryProvider()) }
+        // getCompleted() 是实验性 API，但它正是"不挂起地问一句 async 好了没"的最小手段；
+        // 换成手写 volatile 字段只会更难保证跨线程可见性。
+        //
+        // ⚠️ 它在 job 未完成时抛 IllegalStateException（不是返回 null），而标题通常还没翻完，
+        // 所以必须 runCatching —— 漏了它，"标题比首批慢"这种常态会把整批判成失败。
+        @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+        fun titleSoFarNow(): String? = runCatching { titleJob.getCompleted() }.getOrNull()
+
+        // 术语表在章内只读一次磁盘，之后所有批次复用同一份快照；每批仍只注入命中的条目。
+        //
+        // 取舍：旧实现每批都重新读盘，于是**同一章前面批次刚抽出的新术语**能立刻出现在
+        // 后面批次的提示词里。现在这一条不成立了（跨章术语照常生效，因为下一章会重新读盘）。
+        // 换来的是每批少一次"读盘 + 全量重建字符串"，并且并发批次不会各读一份不同的快照。
+        val glossarySnapshot = runCatching { glossaryProvider() }.getOrDefault("")
+        var previousContext: String? = initialPreviousContext
+
+        val promises = ArrayList<CompletableDeferred<Result<List<String>>>>(batches.size)
+        val permits = Semaphore(window)
+        val offsets = IntArray(batches.size)
+        run {
+            var acc = 0
+            for (k in batches.indices) {
+                offsets[k] = acc
+                acc += batches[k].size
+            }
+        }
+
+        for (k in batches.indices) {
+            val promise = CompletableDeferred<Result<List<String>>>()
+            promises.add(promise)
+            // 门控对象：第 (k - window + 1) 批。
+            //   window = 1 → 等紧邻的上一批，上下文最强、完全串行（默认）；
+            //   window > 1 → 只等"上一次窗口起点"，从而允许窗口内多批同时在跑，
+            //                代价是第 k 批看到的前文是更早某一批的译文尾部。
+            val prevPromise = promises.getOrNull(k - window)
+            async(CoroutineName("translate-batch-$k")) {
+                // ⚠️ 整个批次体必须切到 Dispatchers.IO。
+                //
+                // 调用方可能跑在单线程调度器上（测试里的 runBlocking、Android 的
+                // Dispatchers.Main）。协程在 prevPromise.join() 处挂起后，续体会被派发回
+                // **那个**单线程；随后 permits.withPermit 里发起的请求也就挤在同一线程上，
+                // 只要有一个请求在建立连接/读响应，其余批次就全部排队 —— 并发被静默退化成
+                // 串行（实测 concurrency=1 与 3 的端到端耗时完全相同，就是这么来的）。
+                val outcome = withContext(Dispatchers.IO) {
+                    // 整个批次体都包在 runCatching 里：任何异常都只让"这一批"失败，
+                    // 不能从 async 里逃逸出去取消整章（那会让调用方拿到异常而不是 Failure）。
+                    runCatching {
+                        // 不变量 1：等上一批结束，保证前文译文是真实的上一批译文
+                        prevPromise?.join()
+                        permits.withPermit {
+                            // 上下文与术语表在这里（拿到许可之后）读取。上一批的收割已经完成
+                            // （它正是释放本许可的那一方），因此这里读到的是最新值；
+                            // 读一次到局部变量，避免批次执行中途被改写。
+                            val contextForBatch = previousContext
+                            val glossary = filterGlossaryForBatch(
+                                glossarySnapshot,
+                                batchOriginalText = batches[k].joinToString("\n"),
+                                previousTranslatedText = contextForBatch.orEmpty(),
+                            )
+                            translateOneBatch(
+                                settings, targetLanguage, batches[k], contextForBatch,
+                                styleHint, glossary, inlineImagesPerChapter, sourceIsJapanese,
+                            ) { localIdx, partial ->
+                                val gIdx = offsets[k] + localIdx
+                                if (gIdx in translatedParagraphs.indices) {
+                                    translatedParagraphs[gIdx] = partial
+                                    htmlBuilder.update(gIdx, partial)
+                                    // 节流：SSE 每来一个 delta 都推一次整章 HTML，会让组合期
+                                    // 反复重建整章 Spanned/布局（实测一章能构造 GB 级字符串）。
+                                    // 这里最多每 PARTIAL_FLUSH_INTERVAL_MS 推一次。
+                                    val titleSoFar = titleSoFarNow()
+                                    htmlBuilder.takeIfDirty(force = false)?.let { html ->
+                                        onPartial(titleSoFar, html)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                promise.complete(outcome)
             }
-            val result = resultRes.getOrNull()
-            if (result == null) {
-                failure = "第 ${batchIdx + 1}/${batches.size} 批翻译失败：${resultRes.exceptionOrNull()?.message}"
-                break
-            }
-            // 用最终解析结果再覆盖一遍（保底）
-            val batchTranslated = mutableListOf<String>()
-            for (i in batch.indices) {
-                val translated = result.getOrNull(i)?.takeIf { it.isNotBlank() } ?: batch[i]
-                translatedParagraphs[globalOffset + i] = translated
-                batchTranslated.add(translated)
-            }
-            // 每批翻完后通知调用方更新术语表
-            runCatching { onBatchTranslated(batch, batchTranslated) }
-            // 取本批末尾几段译文作为下一批上下文
-            previousContext = buildPreviousContext(translatedParagraphs, globalOffset, batch.size)
-            globalOffset += batch.size
-            onProgress(batchIdx + 2, total)
-            onPartial(translatedTitle, buildHtml(translatedParagraphs, paragraphs))
         }
-        if (failure != null) return TranslateResult.Failure(failure!!)
 
+        var batchOffset = 0
+        for (k in batches.indices) {
+            val batch = batches[k]
+            // 不变量 2：按批序收割。第 k 批没翻完时，这里就等着 —— 后续批次即使先完成，
+            // 也只能在各自的 promise 里排队，不会插队写进 translatedParagraphs。
+            val outcome = promises[k].await().getOrElse { error ->
+                throw BatchFailed("第 ${k + 1}/${batches.size} 批翻译失败：${error.message}")
+            }
+            val finalTranslations = ArrayList<String>(batch.size)
+            for (i in batch.indices) {
+                val translated = outcome[i].takeIf { it.isNotBlank() } ?: batch[i]
+                translatedParagraphs[batchOffset + i] = translated
+                htmlBuilder.update(batchOffset + i, translated)
+                finalTranslations.add(translated)
+            }
+            previousContext = buildPreviousContext(translatedParagraphs, batchOffset, batch.size)
+            batchOffset += batch.size
+            // 调用方在这里更新术语表（落盘 / 合并）。单一协程按批序调用，调用方无需并发考虑。
+            runCatching { onBatchTranslated(batch, finalTranslations) }
+            onProgress(k + 2, total)
+            // 批末必推：这一批的完整译文（含最终解析结果）必须到达调用方，
+            // 不能因为"刚才节流窗口内已经推过一次"而丢掉。
+            val titleSoFar = titleSoFarNow()
+            htmlBuilder.takeIfDirty(force = true)?.let { html -> onPartial(titleSoFar, html) }
+        }
+
+        val resolvedTitle = titleJob.await()
+        if (resolvedTitle == null) return@coroutineScope TranslateResult.Failure("标题翻译失败")
         // 「一段都没翻出来」必须判失败。
         //
-        // 逐段回退成原文的逻辑在上面（`?: batch[i]`）是必要的保底，但如果没有这道检查，
-        // 模型拒答 / 只吐散文 / 服务端未按 SSE 返回时，每一段都会落到原文，函数却照常
-        // 返回 Success —— 调用方会把「原文」当作「译文」写进缓存并打上 translationLanguage，
-        // 该章此后被判定为已翻译、再也不会重试，而界面上没有任何报错。
+        // 逐段回退成原文的逻辑在 translateOneBatch 里（`?: batch[i]`）是必要的保底，
+        // 但如果没有这道检查，模型拒答 / 只吐散文 / 服务端未按 SSE 返回时，每一段都会
+        // 落到原文，函数却照常返回 Success —— 调用方会把「原文」当作「译文」写进缓存并
+        // 打上 translationLanguage，该章此后被判定为已翻译、再也不会重试，界面上没有任何报错。
         val untranslatedCount = paragraphs.indices.count { translatedParagraphs[it] == paragraphs[it] }
         if (untranslatedCount == paragraphs.size) {
-            return TranslateResult.Failure(
+            TranslateResult.Failure(
                 "模型没有返回可用的译文（${paragraphs.size} 段全部原样返回）。" +
                     "常见原因：模型拒绝翻译、返回了纯文本说明而非 [编号] 译文、" +
                     "或服务端没有按 SSE 返回数据流。" +
                     "若原文本身已是目标语言，请检查设置里的目标语言是否正确。",
             )
+        } else {
+            TranslateResult.Success(
+                translatedTitle = resolvedTitle,
+                html = htmlBuilder.build(),
+            )
         }
-
-        return TranslateResult.Success(
-            translatedTitle = translatedTitle,
-            html = buildHtml(translatedParagraphs, paragraphs),
-        )
     }
 
-    /** 把目前已翻译的段落数组拼成 HTML，未译完的段落降级显示原文。 */
-    private fun buildHtml(translated: List<String>, original: List<String>): String =
-        translated.indices.joinToString(separator = "\n") { i ->
-            val text = translated[i].ifBlank { original.getOrNull(i).orEmpty() }
-            "<p>${escapeHtml(text)}</p>"
+    /** 批次失败：用它从收割循环里跳出，交由 [coroutineScope] 取消其余在途批次。 */
+    private class BatchFailed(message: String) : Exception(message)
+
+    /**
+     * 标题与首批段落并发翻译。
+     *
+     * 旧实现是串行的：标题先翻完（一次完整往返）才发第一批段落请求，首屏第一段译文
+     * 因此被推迟一个 RTT。标题翻译失败不再直接终止整章 —— 返回 null，由调用方决定，
+     * 段落翻译已经在跑，没有理由因为标题丢掉整章。
+     */
+    private suspend fun translateTitleResilient(
+        settings: LlmSettings,
+        targetLanguage: String,
+        title: String,
+        glossary: String,
+    ): String? = runCatching {
+        translateTitleStream(settings, targetLanguage, title, glossary) { }
+    }.getOrNull()
+
+
+    /** 单批翻译；流式回调只报告"真正发生变化"的段落（旧实现每次都回调全批）。 */
+    private suspend fun translateOneBatch(
+        settings: LlmSettings,
+        targetLanguage: String,
+        paragraphs: List<String>,
+        previousContext: String?,
+        styleHint: String,
+        glossary: String,
+        inlineImagesPerChapter: Int,
+        sourceIsJapanese: Boolean,
+        onPartial: (idx: Int, partialText: String) -> Unit,
+    ): List<String> {
+        val numbered = paragraphs.mapIndexed { i, text -> "[${i + 1}] $text" }.joinToString("\n\n")
+        // 构造稳定的 user prefix（动态内容放这里，但顺序固定）：
+        // 风格 → 术语表 → 前文上下文 → 当批原文
+        // 注意：不要把动态内容放进 system prompt，否则 prompt cache 永远 miss。
+        val userBuilder = StringBuilder()
+        if (styleHint.isNotBlank()) {
+            userBuilder.append("【翻译风格】\n").append(styleHint).append("\n\n")
         }
+        if (glossary.isNotBlank()) {
+            userBuilder.append("【术语表（务必遵守）】\n").append(glossary).append("\n\n")
+        }
+        if (previousContext != null) {
+            userBuilder.append("【前文译文（先通读理清情节与主客体关系，人称指代与其保持一致；不要输出）】\n")
+                .append(previousContext).append("\n\n")
+        }
+        userBuilder.append("【需要翻译的段落】\n").append(numbered)
+        // 底部破限（紧贴模型生成位置）：仅追加常量字符串，且位于动态内容之后，
+        // 不影响前缀 prompt cache 命中。
+        val bottomJb = bottomJailbreakSuffix(settings)
+        if (bottomJb.isNotEmpty()) {
+            userBuilder.append("\n\n").append(bottomJb)
+        }
+
+        val msgs = listOf(
+            ChatMessage(
+                role = "system",
+                content = buildBatchSystemPrompt(targetLanguage, settings, inlineImagesPerChapter, sourceIsJapanese),
+            ),
+            ChatMessage(role = "user", content = userBuilder.toString()),
+        )
+        val parser = IncrementalNumberedParser(paragraphs.size)
+        val raw = client.chatStream(settings, msgs) { delta ->
+            // 只处理新增的 delta，不再对整段累积 buffer 重新正则全扫
+            parser.append(delta).forEach { (idx, text) -> onPartial(idx, text) }
+        }.getOrThrow()
+        val parsed = parser.finish(raw)
+        // 漏译兜底：对缺失编号的段落发起一次针对性补译（输出截断/跳段时避免直接回填原文）
+        val missing = parsed.indices.filter { parsed[it].isBlank() }
+        if (missing.isEmpty()) return parsed
+        val retried = runCatching {
+            retryMissingParagraphs(
+                settings, targetLanguage, paragraphs, missing,
+                styleHint, glossary, inlineImagesPerChapter, sourceIsJapanese, onPartial,
+            )
+        }.getOrNull() ?: return parsed
+        return parsed.mapIndexed { i, t -> t.ifBlank { retried[i] } }
+    }
+
+    /**
+     * 章内批次共享的可变上下文：术语表快照 + 上一批译文。
+     *
+     * 只被"同一时刻唯一在跑"的那一批读写 —— 第 k 批要等第 k-1 批结束才启动（见 gates），
+     * 因此这里不需要加锁；不要把它改成无门控的并发读写。
+     */
+    private class BatchContext(glossary: String, previous: String?) {
+        var glossary: String = glossary
+            private set
+        var previous: String? = previous
+            private set
+
+        fun advance(newPrevious: String) {
+            previous = newPrevious
+        }
+    }
+
+    /**
+     * 增量解析 `[N] 译文` 输出。
+     *
+     * 旧实现每收到一个 SSE delta 就对**整个累积 buffer** 重新跑一次正则 + findAll + 全量
+     * substring 分配（O(输出长度) 每次 → 整批 O(n²)）。实测一章 20k 字要吃掉 1.1 秒，
+     * 而这些回调是**同步跑在 SSE 读取循环里**的，等于直接拖慢收字速度。
+     *
+     * 这里改成游标推进：每个 delta 只扫新增的那一段，代价与新增字符数成正比。
+     *
+     * 语义与旧实现保持一致：最后一个 `[N]` 标记之前的内容归属该编号；同一编号出现多次时
+     * 后者覆盖前者（reasoning 模型偶尔会先输出一遍草稿）。
+     */
+    private class IncrementalNumberedParser(private val expected: Int) {
+
+        private val buffer = StringBuilder()
+        private val text = arrayOfNulls<String>(expected)
+        private var lastMarkerEnd = -1
+        private var current = -1
+
+        /** 处理新增的 [delta]，返回**内容发生变化**的段落（下标 0 基）。 */
+        fun append(delta: String): List<Pair<Int, String>> {
+            val from = buffer.length
+            buffer.append(delta)
+            val completed = ArrayList<Pair<Int, String>>(2)
+            var searchFrom = from
+            while (true) {
+                val m = MARKER_RE.find(buffer, searchFrom) ?: break
+                // 新标记出现 → 它之前的内容归属"上一个标记的编号"
+                if (lastMarkerEnd >= 0 && current in 0 until expected) {
+                    emit(completed, current, lastMarkerEnd, m.range.first)
+                }
+                val idx = m.groupValues[1].toIntOrNull()?.minus(1)
+                // 越界编号（模型偶尔写错）不写入 text，但游标照常推进，
+                // 否则下一轮会把同一段重复归属到上一个有效编号。
+                current = if (idx != null && idx in 0 until expected) idx else -1
+                lastMarkerEnd = m.range.last + 1
+                searchFrom = m.range.last + 1
+            }
+            // 当前（尚未闭合的）段落：模型还在往里吐字，已能渲染的部分照样推给调用方
+            if (lastMarkerEnd >= 0 && current in 0 until expected && buffer.length > lastMarkerEnd) {
+                emit(completed, current, lastMarkerEnd, buffer.length)
+            }
+            return completed
+        }
+
+        /**
+         * 收尾解析，返回最终结果 —— 这是**权威**结果，[append] 期间的流式归属只用于渲染。
+         *
+         * 两者在一种情况下会短暂不一致：模型把编号写回头（先 `[4]` 再 `[3]`）时，
+         * 流式阶段会把中间那段文本先记到 4 号、随后由 [finish] 纠正为 3 号。
+         * 旧实现同样是"后出现的编号覆盖先出现的"，最终结果因此完全一致。
+         */
+        fun finish(raw: String): List<String> {
+            val cleaned = raw.replace(Regex("(?is)<think.*?</think>"), "")
+            val matches = MARKER_RE.findAll(cleaned).toList()
+            if (matches.isEmpty()) {
+                // 一个 [N] 都没有：模型没按格式输出。与旧实现一致返回全空，
+                // 由上层 translateOneBatch 走"缺号补译 → 仍缺则回填原文"的兜底。
+                return text.map { it.orEmpty() }
+            }
+            for ((i, m) in matches.withIndex()) {
+                val idx = m.groupValues[1].toIntOrNull()?.minus(1) ?: continue
+                if (idx !in 0 until expected) continue
+                val start = m.range.last + 1
+                val end = if (i + 1 < matches.size) matches[i + 1].range.first else cleaned.length
+                val segment = cleaned.substring(start, end).trim().trim('\n')
+                if (segment.isNotBlank()) text[idx] = segment
+            }
+            return text.map { it.orEmpty() }
+        }
+
+        /**
+         * 取 `[from, to)` 区间的文本作为第 [idx] 段的译文并记录。
+         * 与旧实现一致：内容为空则忽略；内容未变则不重复上报。
+         */
+        private fun emit(into: MutableList<Pair<Int, String>>, idx: Int, from: Int, to: Int) {
+            if (to <= from) return
+            val segment = buffer.substring(from, to).trim().trim('\n')
+            if (segment.isBlank() || segment == text[idx]) return
+            text[idx] = segment
+            into.add(idx to segment)
+        }
+
+        companion object {
+            private val MARKER_RE = Regex("""\[(\d+)\]\s*""")
+        }
+    }
+
+    /**
+     * 增量拼接整章 HTML：每段只 escape 一次，段落变化时只替换该段。
+     *
+     * 旧实现每次 delta 都把整章段落数组 join 一遍并重新 escape（20k 字一章累计构造 341 MB、
+     * 40k 字 1.37 GB 字符串）。这里把代价压到 O(1) 摊销，并用 revision 做去重：
+     * 内容没变就不重新 join，重复内容也不会再推给调用方。
+     */
+    private class IncrementalHtmlBuilder(original: List<String>) {
+
+        private val fallback = original.map { escapeHtml(it) }
+        private val rendered = fallback.toMutableList()
+        private var revision = 0L
+        private var pushedRevision = 0L
+        private var lastPushAtMs = 0L
+
+        fun update(index: Int, text: String) {
+            if (index !in rendered.indices) return
+            val html = escapeHtml(text)
+            if (rendered[index] == html) return
+            rendered[index] = html
+            revision++
+        }
+
+        /**
+         * 取"本次应当推送的整章 HTML"；不该推时返回 null。
+         *
+         * - 内容与上次推送完全相同时返回 null（调用方不必做无谓的状态更新）；
+         * - [force] 用于批末那次必推 —— 节流窗口不能吞掉一批的完整译文。
+         *
+         * 返回 String? 而不是接收 lambda：推送动作留在显式 suspend 上下文里调用，
+         * 避免嵌套 suspend 函数类型带来的类型推断问题。
+         */
+        fun takeIfDirty(force: Boolean): String? {
+            if (revision == pushedRevision) return null
+            val now = System.currentTimeMillis()
+            if (!force && now - lastPushAtMs < PARTIAL_FLUSH_INTERVAL_MS) return null
+            lastPushAtMs = now
+            pushedRevision = revision
+            return build()
+        }
+
+        fun build(): String = rendered.joinToString(separator = "\n") { "<p>$it</p>" }
+    }
 
     /**
      * 从已翻译的 HTML 中提取末尾几段，用作下一章的初始上下文。
@@ -253,67 +657,6 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
         return null
     }
 
-    private suspend fun translateBatchStream(
-        settings: LlmSettings,
-        targetLanguage: String,
-        paragraphs: List<String>,
-        previousContext: String?,
-        styleHint: String,
-        glossary: String,
-        inlineImagesPerChapter: Int,
-        sourceIsJapanese: Boolean,
-        onPartial: (idx: Int, partialText: String) -> Unit,
-    ): List<String> {
-        val numbered = paragraphs.mapIndexed { i, text -> "[${i + 1}] $text" }.joinToString("\n\n")
-        // 构造稳定的 user prefix（动态内容放这里，但顺序固定）：
-        // 风格 → 术语表 → 前文上下文 → 当批原文
-        // 注意：不要把动态内容放进 system prompt，否则 prompt cache 永远 miss。
-        val userBuilder = StringBuilder()
-        if (styleHint.isNotBlank()) {
-            userBuilder.append("【翻译风格】\n").append(styleHint).append("\n\n")
-        }
-        if (glossary.isNotBlank()) {
-            userBuilder.append("【术语表（务必遵守）】\n").append(glossary).append("\n\n")
-        }
-        if (previousContext != null) {
-            userBuilder.append("【前文译文（先通读理清情节与主客体关系，人称指代与其保持一致；不要输出）】\n")
-                .append(previousContext).append("\n\n")
-        }
-        userBuilder.append("【需要翻译的段落】\n").append(numbered)
-        // 底部破限（紧贴模型生成位置）：仅追加常量字符串，且位于动态内容之后，
-        // 不影响前缀 prompt cache 命中。
-        val bottomJb = bottomJailbreakSuffix(settings)
-        if (bottomJb.isNotEmpty()) {
-            userBuilder.append("\n\n").append(bottomJb)
-        }
-
-        val msgs = listOf(
-            ChatMessage(
-                role = "system",
-                content = buildBatchSystemPrompt(targetLanguage, settings, inlineImagesPerChapter, sourceIsJapanese),
-            ),
-            ChatMessage(role = "user", content = userBuilder.toString()),
-        )
-        val buf = StringBuilder()
-        val raw = client.chatStream(settings, msgs) { delta ->
-            buf.append(delta)
-            // 每来一段 delta 就重新解析一次 buffer，把已经能识别的段落推给 UI
-            val partial = parseNumberedOutput(buf.toString(), paragraphs.size)
-            partial.forEachIndexed { i, t -> if (t.isNotBlank()) onPartial(i, t) }
-        }.getOrThrow()
-        val parsed = parseNumberedOutput(raw, paragraphs.size)
-        // 漏译兜底：对缺失编号的段落发起一次针对性补译（输出截断/跳段时避免直接回填原文）
-        val missing = parsed.indices.filter { parsed[it].isBlank() }
-        if (missing.isEmpty()) return parsed
-        val retried = runCatching {
-            retryMissingParagraphs(
-                settings, targetLanguage, paragraphs, missing,
-                styleHint, glossary, inlineImagesPerChapter, sourceIsJapanese, onPartial,
-            )
-        }.getOrNull() ?: return parsed
-        return parsed.mapIndexed { i, t -> t.ifBlank { retried[i] } }
-    }
-
     /**
      * 只重译缺失编号的段落。复用批翻译的 system prompt（保持 prompt cache 命中），
      * 段落保留原 [N] 编号，解析结果天然与全批索引对齐。
@@ -349,35 +692,11 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
             ),
             ChatMessage(role = "user", content = userBuilder.toString()),
         )
-        val buf = StringBuilder()
+        val parser = IncrementalNumberedParser(paragraphs.size)
         val raw = client.chatStream(settings, msgs) { delta ->
-            buf.append(delta)
-            val partial = parseNumberedOutput(buf.toString(), paragraphs.size)
-            for (i in missing) {
-                val t = partial[i]
-                if (t.isNotBlank()) onPartial(i, t)
-            }
+            parser.append(delta).forEach { (i, t) -> if (i in missing) onPartial(i, t) }
         }.getOrThrow()
-        return parseNumberedOutput(raw, paragraphs.size)
-    }
-
-    private fun parseNumberedOutput(raw: String, expected: Int): List<String> {
-        // 先去掉 reasoning model 输出的 <think>...</think> 块
-        val cleaned = raw.replace(Regex("(?is)<think.*?</think>"), "")
-        val regex = Regex("""\[(\d+)\]\s*""")
-        // 用 [N] 切分
-        val matches = regex.findAll(cleaned).toList()
-        if (matches.isEmpty()) return List(expected) { "" }
-        val result = arrayOfNulls<String>(expected)
-        for ((i, m) in matches.withIndex()) {
-            val idx = m.groupValues[1].toIntOrNull()?.minus(1) ?: continue
-            if (idx !in 0 until expected) continue
-            val start = m.range.last + 1
-            val end = if (i + 1 < matches.size) matches[i + 1].range.first else cleaned.length
-            val segment = cleaned.substring(start, end).trim().trim('\n')
-            if (segment.isNotBlank()) result[idx] = segment
-        }
-        return result.map { it.orEmpty() }
+        return parser.finish(raw)
     }
 
     private fun extractParagraphs(html: String): List<String> {
@@ -408,9 +727,6 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
     /** 平假名/片假名检测：日文正文几乎必含假名；中文文本不含，不会误判。 */
     private fun containsJapaneseKana(text: String): Boolean =
         text.any { it in '\u3040'..'\u30FF' }
-
-    private fun escapeHtml(s: String): String =
-        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     /**
      * 稳定的批翻译 system prompt（仅依赖 targetLanguage 与 model）。
@@ -636,6 +952,12 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
         const val CONTEXT_TAIL_PARAGRAPHS = 8
         const val CONTEXT_MAX_CHARS = 1200
 
+        /** 在途批次上限。1 = 完全串行（默认，行为与旧版一致）。 */
+        const val MAX_TRANSLATION_CONCURRENCY = 4
+
+        /** 流式部分译文的最小推送间隔，避免组合期反复重建整章 Spanned / 重新布局。 */
+        const val PARTIAL_FLUSH_INTERVAL_MS = 250L
+
         // ============= 破限前缀（顶部，system prompt 前置） =============
         // 设计要求：
         //  1) 必须是常量字符串，避免任何动态拼接（章节、段落、术语等）。
@@ -748,3 +1070,10 @@ OUTPUT FORMAT: 严格按 [编号] 译文，一段一行，无前后缀、无 Mar
 直接输出译文："""
     }
 }
+
+/**
+ * 段落文本 → HTML 转义。放在文件顶层：嵌套类（[ChapterTranslator.IncrementalHtmlBuilder]）
+ * 访问不到外部类的成员，而它需要这个函数。
+ */
+private fun escapeHtml(s: String): String =
+    s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

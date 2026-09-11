@@ -54,6 +54,7 @@ fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () ->
     var language by remember(state.prefs) { mutableStateOf(state.prefs.translationLanguage) }
     var style by remember(state.prefs) { mutableStateOf(state.prefs.translationStyle) }
     var batchChars by remember(state.prefs) { mutableStateOf(state.prefs.translationBatchChars.toString()) }
+    var concurrency by remember(state.prefs) { mutableStateOf(state.prefs.translationConcurrency) }
     var prefetchAhead by remember(state.prefs) { mutableStateOf(state.prefs.webPrefetchAhead.toString()) }
 
     // ---- 站点登录（桌面端没有内嵌浏览器，只能手动粘贴）----
@@ -250,6 +251,23 @@ fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () ->
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                OutlinedTextField(
+                    value = concurrency.toString(),
+                    onValueChange = { concurrency = (it.filter(Char::isDigit).toIntOrNull() ?: 1).coerceIn(1, 4) },
+                    label = { Text("同时在途的批次请求数") },
+                    supportingText = {
+                        Text(
+                            if (concurrency <= 1) {
+                                "1 = 串行（默认）。每个 API Key 的并发额度只有你自己知道，所以不替你打开。"
+                            } else {
+                                "并发 $concurrency 路：允许后一批与前一批同时在跑，整章更快；" +
+                                    "前文译文取自更早一批，指代衔接略弱于串行。"
+                            },
+                        )
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
 
                 Spacer(Modifier.height(4.dp))
                 SectionTitle("网页小说")
@@ -372,6 +390,7 @@ fun SettingsDialog(state: DesktopUiState, app: DesktopAppState, onDismiss: () ->
                         translationStyle = style,
                         translationBatchChars = batchChars.toIntOrNull()
                             ?.coerceIn(500, 20000) ?: state.prefs.translationBatchChars,
+                        translationConcurrency = concurrency.coerceIn(1, 4),
                         webPrefetchAhead = prefetchAhead.toIntOrNull()
                             ?.coerceIn(0, 20) ?: state.prefs.webPrefetchAhead,
                         pixivPhpSessId = pixivCookie.trim(),

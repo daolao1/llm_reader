@@ -69,6 +69,20 @@ class DesktopAppState(
     /** 当前这本书的进度 key：本地书 = 文件绝对路径，网页书 = canonical url。 */
     private var currentBookKey: String? = null
 
+    /** 流式部分译文的节流时间戳（见 [partialFlushDue]）。 */
+    private var lastPartialFlushAt = 0L
+
+    /**
+     * 部分译文是否该推送。250ms 与 Android 侧 `PartialBuffer` 保持一致 ——
+     * 每次推送都会让阅读区整章重新布局，太频繁只会在低端机上掉帧。
+     */
+    private fun partialFlushDue(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastPartialFlushAt < 250) return false
+        lastPartialFlushAt = now
+        return true
+    }
+
     /**
      * 章节抓取任务。必须持有引用，否则 `closeBook` 取消不掉，
      * 抓取结果会在用户已经离开这本书之后把书塞回界面。
@@ -416,59 +430,65 @@ class DesktopAppState(
                 entries.joinToString("\n") { "${it.original} → ${it.translated}" }
             }
 
-            val result = runCatching {
-                core.translator.translate(
-                    settings = _state.value.settings,
-                    targetLanguage = targetLang,
-                    chapterTitle = chapter.title,
-                    chapterHtml = html,
-                    styleHint = st.prefs.translationStyle,
-                    glossaryProvider = glossaryProvider,
-                    batchChars = st.prefs.translationBatchChars,
-                    onProgress = { current, total ->
-                        _state.update { it.copy(translationProgress = "翻译中 $current/$total") }
-                    },
-                    onPartial = { partialTitle, partialHtml ->
+            // 用 translateStreaming 而不是 translate：只有它接受 concurrency，
+            // 并且把最终结果从 onFinish 交还（外层不再需要 runCatching 包一层）。
+            core.translator.translateStreaming(
+                settings = _state.value.settings,
+                targetLanguage = targetLang,
+                chapterTitle = chapter.title,
+                chapterHtml = html,
+                styleHint = st.prefs.translationStyle,
+                glossaryProvider = glossaryProvider,
+                batchChars = st.prefs.translationBatchChars,
+                concurrency = st.prefs.translationConcurrency,
+                onProgress = { done, total ->
+                    _state.update { it.copy(translationProgress = "翻译中 $done/$total") }
+                },
+                onPartial = { partialTitle, partialHtml ->
+                    // 桌面端过去完全没有节流：每个 delta 都走一次 _state.update，
+                    // 而 ReaderScreen 会据此重新把整章转成 AnnotatedString 并重新布局。
+                    // Android 侧有 PartialBuffer，这里补上同样的 250ms 节流。
+                    // 批末那次完整译文由 ChapterTranslator 强制推送，不会被这里吞掉。
+                    if (partialFlushDue()) {
                         applyTranslation(index, partialTitle, partialHtml)
-                    },
-                    // 每批翻完抽取人名/专有名词并落库。
-                    // 桌面端旧实现只**读**术语表（glossaryProvider），从不写入，
-                    // 也没有传 onBatchTranslated（其默认实现是空操作）——
-                    // 于是 glossaryProvider 永远返回空串，跨章译名一致性在桌面端
-                    // 根本不存在，glossaryDedupeInterval / glossaryMaxSize 是死设置。
-                    onBatchTranslated = { batchOriginal, batchTranslated ->
-                        runCatching {
-                            val extracted = core.translator.extractGlossary(
-                                _state.value.settings,
-                                targetLang,
-                                batchOriginal.joinToString("\n") { "<p>$it</p>" },
-                                batchTranslated.joinToString("\n") { "<p>$it</p>" },
-                            )
-                            if (extracted.isNotBlank()) {
-                                mergeGlossary(canonical, parseGlossaryLines(extracted))
-                            }
+                    }
+                },
+                // 每批翻完抽取人名/专有名词并落库。
+                // 桌面端旧实现只**读**术语表（glossaryProvider），从不写入，
+                // 也没有传 onBatchTranslated（其默认实现是空操作）——
+                // 于是 glossaryProvider 永远返回空串，跨章译名一致性在桌面端
+                // 根本不存在，glossaryDedupeInterval / glossaryMaxSize 是死设置。
+                onBatchTranslated = { batchOriginal, batchTranslated ->
+                    runCatching {
+                        val extracted = core.translator.extractGlossary(
+                            _state.value.settings,
+                            targetLang,
+                            batchOriginal.joinToString("\n") { "<p>$it</p>" },
+                            batchTranslated.joinToString("\n") { "<p>$it</p>" },
+                        )
+                        if (extracted.isNotBlank()) {
+                            mergeGlossary(canonical, parseGlossaryLines(extracted))
                         }
-                    },
-                )
-            }.getOrElse { e ->
-                ChapterTranslator.TranslateResult.Failure(e.message ?: "翻译失败")
-            }
-
-            when (result) {
-                is ChapterTranslator.TranslateResult.Success -> {
-                    applyTranslation(index, result.translatedTitle, result.html)
-                    persistTranslation(canonical, index, result.translatedTitle, result.html, targetLang)
-                }
-                is ChapterTranslator.TranslateResult.Failure -> {
-                    _state.update { it.copy(error = "第 ${index + 1} 章${result.message}") }
-                }
-            }
-            _state.update {
-                it.copy(
-                    translatingChapters = it.translatingChapters - index,
-                    translationProgress = null,
-                )
-            }
+                    }
+                },
+                onFinish = { result ->
+                    when (result) {
+                        is ChapterTranslator.TranslateResult.Success -> {
+                            applyTranslation(index, result.translatedTitle, result.html)
+                            persistTranslation(canonical, index, result.translatedTitle, result.html, targetLang)
+                        }
+                        is ChapterTranslator.TranslateResult.Failure -> {
+                            _state.update { it.copy(error = "第 ${index + 1} 章${result.message}") }
+                        }
+                    }
+                    _state.update {
+                        it.copy(
+                            translatingChapters = it.translatingChapters - index,
+                            translationProgress = null,
+                        )
+                    }
+                },
+            )
         }
     }
 

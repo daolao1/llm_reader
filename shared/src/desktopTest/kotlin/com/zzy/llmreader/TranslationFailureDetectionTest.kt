@@ -44,11 +44,18 @@ class TranslationFailureDetectionTest {
             }
         }
 
-    private suspend fun translate(settings: LlmSettings) = ChapterTranslator().translate(
+    /**
+     * 走**生产实际使用的那条路径**：`translateStreaming`（App 两端都改用它，
+     * 因为只有它接受 concurrency、并把结果从 onFinish 交还）。
+     *
+     * 另有 [translate 便捷重载] 一条用例覆盖 `translate()` 包装器本身。
+     */
+    private suspend fun translate(settings: LlmSettings) = ChapterTranslator().translateStreaming(
         settings = settings,
         targetLanguage = "简体中文",
         chapterTitle = "第一章",
         chapterHtml = sourceHtml,
+        onFinish = {},
     )
 
     @Test
@@ -96,5 +103,24 @@ class TranslationFailureDetectionTest {
         assertContains(result.html, "你好世界")
         assertContains(result.html, "今天天气真好")
         assertTrue(!result.html.contains("こんにちは"), "译文里不应残留日文原文")
+    }
+
+    /** `translate()` 是给"只要结果、不关心流式"的调用方留的便捷重载，别让它悄悄失效。 */
+    @Test
+    fun `便捷重载 translate 仍返回同一份结果`() = withStubServer(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"[1] 你好世界。\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\\n[2] 今天天气真好。\"}}]}\n\n" +
+            "data: [DONE]\n\n",
+        "text/event-stream",
+    ) { settings ->
+        val result = ChapterTranslator().translate(
+            settings = settings,
+            targetLanguage = "简体中文",
+            chapterTitle = "第一章",
+            chapterHtml = sourceHtml,
+        )
+        assertTrue(result is ChapterTranslator.TranslateResult.Success, "便捷重载失败：$result")
+        assertContains(result.html, "你好世界")
+        assertContains(result.html, "今天天气真好")
     }
 }
