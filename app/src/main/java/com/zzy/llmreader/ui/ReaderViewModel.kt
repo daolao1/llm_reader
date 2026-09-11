@@ -1478,7 +1478,12 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val tx = result.getOrDefault(emptyMap())
-        if (tx.isEmpty()) return
+        if (tx.isEmpty()) {
+            // 没抛异常却一条都没解析出来：多半是模型没按 `<编号>. <译名>` 回。
+            // 以前这里直接 return，用户的现象是"目录点了翻译没反应"，日志里也无迹可寻。
+            android.util.Log.w("ReaderVM", "TOC chunk empty parse, chunk=${chunk.size}")
+            return
+        }
         cacheMutex.withLock {
             val cached = withContext(Dispatchers.IO) { webCache.read(canonical) } ?: return@withLock
             val newChapters = cached.chapters.toMutableList()
@@ -1499,7 +1504,8 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         style: String,
         chunk: List<Pair<Int, String>>,
     ): Map<Int, String> {
-        val (jbTop, jbBottom) = translator.jailbreakPair(settings)
+        // 结构化链路专用破限：不写死输出格式，避免与下面的 `<编号>. <译名>` 契约打架。
+        val (jbTop, jbBottom) = translator.structuredJailbreakPair(settings)
         val sys = buildString {
             if (jbTop.isNotEmpty()) append(jbTop).append("\n\n")
             append("你是小说阅读 app 的目录翻译引擎，把以下编号的章节标题逐条翻译为").append(target).append("。")
@@ -1521,9 +1527,12 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                 com.zzy.llmreader.llm.ChatMessage(role = "user", content = userBody),
             ),
             forceMinimalReasoning = true,
+            // 助手预填：锁定 `<编号>. <译名>` 的开头，模型无法以解释/拒绝起笔。
+            prefill = "1. ",
         ).getOrElse { throw it }
         val out = mutableMapOf<Int, String>()
-        val numRe = Regex("^\\s*(\\d+)[\\.\\)、]\\s*(.+)$")
+        // 兼容两种编号形式：调用方契约的 `1. 译名`，以及模型惯性输出的 `[1] 译名`。
+        val numRe = Regex("^\\s*\\[?(\\d+)[\\]\\.\\)、]\\s*(.+)$")
         for (line in res.lineSequence()) {
             val m = numRe.find(line) ?: continue
             val one = m.groupValues[1].toIntOrNull() ?: continue

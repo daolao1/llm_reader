@@ -165,6 +165,23 @@ import kotlinx.coroutines.withContext
                     ),
                 )
             }
+
+            // 请求发了却一条都没解析出来 → 明确报错，不要只是把转圈停掉。
+            // 这几条链路曾因破限与输出契约打架而整批解析失败，UI 上表现为
+            // "点了翻译什么都没发生"，用户没有任何线索可判断。
+            val silent = buildList {
+                if (pendingBooks.isNotEmpty() && bookResults.isEmpty()) add("书目")
+                if (pendingTags.isNotEmpty() && tagResults.isEmpty()) add("标签")
+            }
+            if (silent.isNotEmpty()) {
+                _state.update {
+                    it.copy(
+                        discovery = it.discovery.copy(
+                            error = "${silent.joinToString("、")}翻译没有结果：模型未按指定格式输出（可重试或换模型）",
+                        ),
+                    )
+                }
+            }
         }
     }
 
@@ -266,7 +283,8 @@ import kotlinx.coroutines.withContext
         style: String,
         jobs: List<BookJob>,
     ): Map<String, Pair<String, String>> {
-        val (jbTop, jbBottom) = translator.jailbreakPair(settings)
+        // 结构化链路专用破限：不写死输出格式，避免与下面的 `<编号>. <译文>` 契约打架。
+        val (jbTop, jbBottom) = translator.structuredJailbreakPair(settings)
         val sys = buildString {
             if (jbTop.isNotEmpty()) append(jbTop).append("\n\n")
             append("你是小说库 app 的书目翻译引擎，把下面 N 本书的标题和简介完整、忠实、一对一地翻译为").append(target).append("。")
@@ -318,6 +336,8 @@ import kotlinx.coroutines.withContext
                 com.zzy.llmreader.llm.ChatMessage(role = "user", content = userBody),
             ),
             forceMinimalReasoning = true,
+            // 助手预填：直接以第一条记录的格式开头，模型无法以解释/拒绝起笔。
+            prefill = "INDEX: 1\nTITLE: ",
         ) { delta ->
             buffer.append(delta)
             flush()
@@ -410,7 +430,8 @@ import kotlinx.coroutines.withContext
         target: String,
         tags: List<String>,
     ): Map<String, String> {
-        val (jbTop, jbBottom) = translator.jailbreakPair(settings)
+        // 结构化链路专用破限：不写死输出格式，避免与下面的 `<编号>. <译文>` 契约打架。
+        val (jbTop, jbBottom) = translator.structuredJailbreakPair(settings)
         val sys = buildString {
             if (jbTop.isNotEmpty()) append(jbTop).append("\n\n")
             append("你是小说库 app 的分类标签翻译引擎，把下列编号标签逐个翻译为").append(target).append("。")
@@ -431,12 +452,15 @@ import kotlinx.coroutines.withContext
                 com.zzy.llmreader.llm.ChatMessage(role = "user", content = userBody),
             ),
             forceMinimalReasoning = true,
+            // 助手预填：锁定 `<编号>. <译文>` 的开头，避免模型先用一句话解释再输出。
+            prefill = "1. ",
         ).getOrElse {
             android.util.Log.w("ReaderVM", "translateTagsOnce chat error", it)
             throw it
         }
         val out = mutableMapOf<String, String>()
-        val numRe = Regex("^\\s*(\\d+)[\\.|、)]\\s*(.+)$")
+        // 兼容两种编号形式：调用方契约的 `1. 译文`，以及模型惯性输出的 `[1] 译文`。
+        val numRe = Regex("^\\s*\\[?(\\d+)[\\]\\.|、)]\\s*(.+)$")
         for (line in res.lineSequence()) {
             val m = numRe.find(line) ?: continue
             val idx = m.groupValues[1].toIntOrNull() ?: continue
