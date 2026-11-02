@@ -9,6 +9,7 @@ import org.intellij.markdown.html.HtmlGenerator
 import org.intellij.markdown.parser.MarkdownParser
 import org.jsoup.Jsoup
 import java.io.InputStream
+import java.net.URLDecoder
 import java.nio.charset.Charset
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
@@ -140,7 +141,12 @@ object EpubParser {
         val chapters = mutableListOf<Chapter>()
         spineHrefs.forEachIndexed { index, idref ->
             val href = manifest[idref] ?: return@forEachIndexed
-            val full = if (opfDir.isEmpty()) href else "$opfDir/$href"
+            // spine 可能指向章内锚点，且 ZIP 条目名保存的是解码后的路径。
+            // 不剥离 fragment、保留 %20 等转义都会让已有章节被静默跳过。
+            val hrefPath = href.substringBefore('#').substringBefore('?')
+            val decodedHref = runCatching { URLDecoder.decode(hrefPath, Charsets.UTF_8.name()) }
+                .getOrDefault(hrefPath)
+            val full = if (opfDir.isEmpty()) decodedHref else "$opfDir/$decodedHref"
             val normalized = normalizePath(full)
             val data = entries[normalized] ?: return@forEachIndexed
             val html = String(data, Charsets.UTF_8)

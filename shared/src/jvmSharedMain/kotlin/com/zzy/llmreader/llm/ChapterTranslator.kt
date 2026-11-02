@@ -6,8 +6,6 @@ import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 
@@ -181,10 +179,8 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
         // 后面批次的提示词里。现在这一条不成立了（跨章术语照常生效，因为下一章会重新读盘）。
         // 换来的是每批少一次"读盘 + 全量重建字符串"，并且并发批次不会各读一份不同的快照。
         val glossarySnapshot = runCatching { glossaryProvider() }.getOrDefault("")
-        var previousContext: String? = initialPreviousContext
-
         val promises = ArrayList<CompletableDeferred<Result<List<String>>>>(batches.size)
-        val permits = Semaphore(window)
+        // k-window 依赖同时提供并发上限与真实前驱结果，无需第二套上下文通知或限流。
         val offsets = IntArray(batches.size)
         run {
             var acc = 0
@@ -203,44 +199,31 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
             //                代价是第 k 批看到的前文是更早某一批的译文尾部。
             val prevPromise = promises.getOrNull(k - window)
             async(CoroutineName("translate-batch-$k")) {
-                // ⚠️ 整个批次体必须切到 Dispatchers.IO。
-                //
-                // 调用方可能跑在单线程调度器上（测试里的 runBlocking、Android 的
-                // Dispatchers.Main）。协程在 prevPromise.join() 处挂起后，续体会被派发回
-                // **那个**单线程；随后 permits.withPermit 里发起的请求也就挤在同一线程上，
-                // 只要有一个请求在建立连接/读响应，其余批次就全部排队 —— 并发被静默退化成
-                // 串行（实测 concurrency=1 与 3 的端到端耗时完全相同，就是这么来的）。
+                // 整批网络请求切到 IO，避免阻塞单线程的调用方，也避免并发静默退化成串行。
                 val outcome = withContext(Dispatchers.IO) {
-                    // 整个批次体都包在 runCatching 里：任何异常都只让"这一批"失败，
-                    // 不能从 async 里逃逸出去取消整章（那会让调用方拿到异常而不是 Failure）。
                     runCatching {
-                        // 不变量 1：等上一批结束，保证前文译文是真实的上一批译文
-                        prevPromise?.join()
-                        permits.withPermit {
-                            // 上下文与术语表在这里（拿到许可之后）读取。上一批的收割已经完成
-                            // （它正是释放本许可的那一方），因此这里读到的是最新值；
-                            // 读一次到局部变量，避免批次执行中途被改写。
-                            val contextForBatch = previousContext
-                            val glossary = filterGlossaryForBatch(
-                                glossarySnapshot,
-                                batchOriginalText = batches[k].joinToString("\n"),
-                                previousTranslatedText = contextForBatch.orEmpty(),
-                            )
-                            translateOneBatch(
-                                settings, targetLanguage, batches[k], contextForBatch,
-                                styleHint, glossary, inlineImagesPerChapter, sourceIsJapanese,
-                            ) { localIdx, partial ->
-                                val gIdx = offsets[k] + localIdx
-                                if (gIdx in translatedParagraphs.indices) {
-                                    translatedParagraphs[gIdx] = partial
-                                    htmlBuilder.update(gIdx, partial)
-                                    // 节流：SSE 每来一个 delta 都推一次整章 HTML，会让组合期
-                                    // 反复重建整章 Spanned/布局（实测一章能构造 GB 级字符串）。
-                                    // 这里最多每 PARTIAL_FLUSH_INTERVAL_MS 推一次。
-                                    val titleSoFar = titleSoFarNow()
-                                    htmlBuilder.takeIfDirty(force = false)?.let { html ->
-                                        onPartial(titleSoFar, html)
-                                    }
+                        // 直接从约定前驱的结果取真实译文；失败时保留章节初始上下文。
+                        val contextForBatch = prevPromise?.await()?.getOrNull()?.let { translated ->
+                            translated.takeLast(CONTEXT_TAIL_PARAGRAPHS).filter { it.isNotBlank() }
+                                .joinToString("\n").takeLast(CONTEXT_MAX_CHARS)
+                        } ?: initialPreviousContext
+                        val glossary = filterGlossaryForBatch(
+                            glossarySnapshot,
+                            batchOriginalText = batches[k].joinToString("\n"),
+                            previousTranslatedText = contextForBatch.orEmpty(),
+                        )
+                        translateOneBatch(
+                            settings, targetLanguage, batches[k], contextForBatch,
+                            styleHint, glossary, inlineImagesPerChapter, sourceIsJapanese,
+                        ) { localIdx, partial ->
+                            val gIdx = offsets[k] + localIdx
+                            if (gIdx in translatedParagraphs.indices) {
+                                translatedParagraphs[gIdx] = partial
+                                htmlBuilder.update(gIdx, partial)
+                                // 节流，避免 SSE 高频回调反复触发整章布局。
+                                val titleSoFar = titleSoFarNow()
+                                htmlBuilder.takeIfDirty(force = false)?.let { html ->
+                                    onPartial(titleSoFar, html)
                                 }
                             }
                         }
@@ -265,7 +248,6 @@ class ChapterTranslator(private val client: LlmClient = LlmClient()) {
                 htmlBuilder.update(batchOffset + i, translated)
                 finalTranslations.add(translated)
             }
-            previousContext = buildPreviousContext(translatedParagraphs, batchOffset, batch.size)
             batchOffset += batch.size
             // 调用方在这里更新术语表（落盘 / 合并）。单一协程按批序调用，调用方无需并发考虑。
             runCatching { onBatchTranslated(batch, finalTranslations) }

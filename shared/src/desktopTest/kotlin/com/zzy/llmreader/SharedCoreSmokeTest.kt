@@ -113,6 +113,23 @@ class SharedCoreSmokeTest {
     }
 
     @Test
+    fun `EPUB spine 的锚点和 URL 转义路径不会丢章`() = runBlocking {
+        val epub = buildEpub(
+            title = "带链接的书",
+            chapters = listOf("第一章" to "<p>正文保留</p>"),
+            href = "chapter%201.xhtml#section-2",
+            chapterPath = "OEBPS/chapter 1.xhtml",
+        )
+        val core = LlmReaderCore(tempDirs())
+        val book = core.documentParser.parse(
+            BytesBookSource("e2", "linked.epub", "application/epub+zip", epub),
+        ) as BookContent.Text
+
+        assertEquals(1, book.chapters.size, "带 fragment 的 spine 项也必须解析")
+        assertContains(assertNotNull(book.chapters[0].content), "正文保留")
+    }
+
+    @Test
     fun `PDF 走到 Pdf 分支而不是当成文本`() = runBlocking {
         val core = LlmReaderCore(tempDirs())
         val book = core.documentParser.parse(
@@ -232,7 +249,12 @@ class SharedCoreSmokeTest {
     }
 
     /** 现造一个最小可用的 EPUB（ZIP + container.xml + opf + 章节 xhtml）。 */
-    private fun buildEpub(title: String, chapters: List<Pair<String, String>>): ByteArray {
+    private fun buildEpub(
+        title: String,
+        chapters: List<Pair<String, String>>,
+        href: String? = null,
+        chapterPath: String? = null,
+    ): ByteArray {
         val out = ByteArrayOutputStream()
         ZipOutputStream(out).use { zip ->
             fun entry(name: String, content: String) {
@@ -251,7 +273,8 @@ class SharedCoreSmokeTest {
             )
 
             val manifest = chapters.indices.joinToString("") {
-                """<item id="c$it" href="c$it.xhtml" media-type="application/xhtml+xml"/>"""
+                val chapterHref = if (it == 0) href ?: "c$it.xhtml" else "c$it.xhtml"
+                """<item id="c$it" href="$chapterHref" media-type="application/xhtml+xml"/>"""
             }
             val spine = chapters.indices.joinToString("") { """<itemref idref="c$it"/>""" }
             entry(
@@ -266,7 +289,7 @@ class SharedCoreSmokeTest {
 
             chapters.forEachIndexed { i, (chapterTitle, body) ->
                 entry(
-                    "OEBPS/c$i.xhtml",
+                    if (i == 0) chapterPath ?: "OEBPS/c$i.xhtml" else "OEBPS/c$i.xhtml",
                     """<?xml version="1.0" encoding="utf-8"?>
                        <html><head><title>$chapterTitle</title></head><body>$body</body></html>""",
                 )

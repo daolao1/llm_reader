@@ -3,6 +3,8 @@ package com.zzy.llmreader.image
 import com.zzy.llmreader.data.ImageBackend
 import com.zzy.llmreader.platform.AppDirs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -24,6 +26,12 @@ class ImageCache(private val dirs: AppDirs) {
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
     private val rootDir: File
         get() = File(dirs.dataDir, "gen_images").apply { if (!exists()) mkdirs() }
+
+    private val chapterLocks = mutableMapOf<Pair<String, Int>, Mutex>()
+    private val locksGuard = Mutex()
+
+    private suspend fun chapterMutex(bookId: String, chapterIndex: Int): Mutex =
+        locksGuard.withLock { chapterLocks.getOrPut(bookId to chapterIndex) { Mutex() } }
 
     @Serializable
     data class GeneratedImage(
@@ -90,41 +98,45 @@ class ImageCache(private val dirs: AppDirs) {
         backend: ImageBackend,
         width: Int,
         height: Int,
-    ): GeneratedImage = withContext(Dispatchers.IO) {
-        val dir = chapterDir(bookId, chapterIndex)
-        val id = System.currentTimeMillis().toString() + "_" +
-            (1..6).map { ('a'..'z').random() }.joinToString("")
-        val filename = "$id.png"
-        File(dir, filename).writeBytes(bytes)
-        val entry = GeneratedImage(
-            id = id,
-            filename = filename,
-            prompt = prompt,
-            negative = negative,
-            backend = backend.name,
-            width = width,
-            height = height,
-            createdAt = System.currentTimeMillis(),
-        )
-        val current = list(bookId, chapterIndex)
-        val updated = ChapterIndex(images = current + entry)
-        com.zzy.llmreader.platform.writeTextAtomically(
-            indexFile(bookId, chapterIndex),
-            json.encodeToString(ChapterIndex.serializer(), updated),
-        )
-        entry
-    }
-
-    suspend fun delete(bookId: String, chapterIndex: Int, id: String) =
+    ): GeneratedImage = chapterMutex(bookId, chapterIndex).withLock {
         withContext(Dispatchers.IO) {
-            val current = list(bookId, chapterIndex)
-            val match = current.find { it.id == id } ?: return@withContext
-            File(chapterDir(bookId, chapterIndex), match.filename).delete()
-            val updated = ChapterIndex(images = current.filter { it.id != id })
+            val dir = chapterDir(bookId, chapterIndex)
+            val id = System.currentTimeMillis().toString() + "_" +
+                (1..6).map { ('a'..'z').random() }.joinToString("")
+            val filename = "$id.png"
+            File(dir, filename).writeBytes(bytes)
+            val entry = GeneratedImage(
+                id = id,
+                filename = filename,
+                prompt = prompt,
+                negative = negative,
+                backend = backend.name,
+                width = width,
+                height = height,
+                createdAt = System.currentTimeMillis(),
+            )
+            val current = readIndex(indexFile(bookId, chapterIndex))
+            val updated = ChapterIndex(images = current + entry)
             com.zzy.llmreader.platform.writeTextAtomically(
                 indexFile(bookId, chapterIndex),
                 json.encodeToString(ChapterIndex.serializer(), updated),
             )
+            entry
+        }
+    }
+
+    suspend fun delete(bookId: String, chapterIndex: Int, id: String) =
+        chapterMutex(bookId, chapterIndex).withLock {
+            withContext(Dispatchers.IO) {
+                val current = readIndex(indexFile(bookId, chapterIndex))
+                val match = current.find { it.id == id } ?: return@withContext
+                File(chapterDir(bookId, chapterIndex), match.filename).delete()
+                val updated = ChapterIndex(images = current.filter { it.id != id })
+                com.zzy.llmreader.platform.writeTextAtomically(
+                    indexFile(bookId, chapterIndex),
+                    json.encodeToString(ChapterIndex.serializer(), updated),
+                )
+            }
         }
 
     fun fileFor(bookId: String, chapterIndex: Int, filename: String): File =

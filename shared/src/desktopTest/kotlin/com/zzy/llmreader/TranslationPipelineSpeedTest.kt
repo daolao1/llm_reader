@@ -37,6 +37,8 @@ class TranslationPipelineSpeedTest {
         /** 每个"段落翻译"请求的起止时间（标题请求不计入）。 */
         private val windows = java.util.concurrent.ConcurrentHashMap<Long, Long>()
         private val order = ArrayList<Long>()
+        private val batchBodies = java.util.concurrent.ConcurrentHashMap<Int, String>()
+        private val batchStarts = java.util.concurrent.CopyOnWriteArrayList<Int>()
 
         private val server: HttpServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         private val timeline = ArrayList<String>()
@@ -62,14 +64,23 @@ class TranslationPipelineSpeedTest {
             timeline.joinToString("\n      ")
         }
 
+        fun batchBody(firstParagraph: Int): String? = batchBodies[firstParagraph]
+
+        fun batchStarts(): List<Int> = batchStarts.sorted()
+
         private fun handle(ex: HttpExchange, paragraphCount: Int) {
             val body = ex.requestBody.readBytes().toString(Charsets.UTF_8)
             val now = System.currentTimeMillis()
             val running = concurrentNow.incrementAndGet()
             maxConcurrent.updateAndGet { maxOf(it, running) }
             val isTitle = !body.contains("【需要翻译的段落】")
-            val firstIdx = Regex("""\[(\d+)]""").find(body)?.groupValues?.get(1) ?: "-"
+            val firstIdx = Regex("""ばんごう (\d+) の原文""")
+                .find(body.substringAfter("【需要翻译的段落】", ""))?.groupValues?.get(1) ?: "-"
             if (!isTitle) synchronized(lock) { order.add(now) }
+            if (!isTitle) firstIdx.toIntOrNull()?.let {
+                batchBodies[it] = body
+                batchStarts.add(it)
+            }
             synchronized(lock) {
                 timeline.add(
                     "@${now - t0}ms 起 ${if (isTitle) "标题" else "批(首段#$firstIdx)"} 在途=$running " +
@@ -185,10 +196,23 @@ class TranslationPipelineSpeedTest {
             }
             assertTrue(overlapped, "concurrency=3 时观测不到任何请求重叠，说明批次仍在串行")
 
+            // 后续批次必须收到其约定前驱的**真实译文**，而不是尚未更新的共享 previousContext。
+            // 使用服务端实际记录的批次首段号，不把原文长度/分批大小写死。
+            val window = 3
+            val starts = stub.batchStarts()
+            for (k in window until starts.size) {
+                val body = stub.batchBody(starts[k])
+                assertTrue(body != null, "未捕获第 ${k + 1} 批请求体")
+                val previousLast = starts.getOrElse(k - window + 1) { 40 } - 1
+                assertTrue(
+                    body.contains("【前文译文") && body.contains("这是第 $previousLast 段的译文内容。"),
+                    "第 ${k + 1} 批缺少前驱批次末尾的真实前文译文（第 $previousLast 段）",
+                )
+            }
+
             // 3) 上下文门控：第 k 批必须等第 (k - window + 1) 批返回后才发请求。
             //    这是"前文译文必须来自已翻完的批次"这条不变量的可观测形式。
             //    允许 50ms 误差（墙上时钟 + 协程调度）。
-            val window = 3
             windows.forEachIndexed { k, w ->
                 val gateIdx = k - window
                 if (gateIdx >= 0) {

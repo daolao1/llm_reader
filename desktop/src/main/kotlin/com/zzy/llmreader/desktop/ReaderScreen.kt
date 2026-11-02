@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -20,7 +21,11 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -39,7 +44,9 @@ import com.zzy.llmreader.data.TranslationMode
 import com.zzy.llmreader.format.RichBlock
 import com.zzy.llmreader.format.htmlToRichBlocks
 import com.zzy.llmreader.format.stripInlineImageMarkers
+import com.zzy.llmreader.model.BookContent
 import com.zzy.llmreader.model.Chapter
+import kotlinx.coroutines.flow.collectLatest
 
 @Composable
 fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier = Modifier) {
@@ -52,6 +59,9 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
     }
     // 切章回到顶部
     LaunchedEffect(state.currentChapter) { listState.scrollToItem(0) }
+    // 打开书时恢复一次；主动切章仍回顶部。窗口/字号变化只重新测量，不突然跳章。
+    var lastMeasuredBook by remember { androidx.compose.runtime.mutableStateOf<BookContent.Text?>(null) }
+    var lastMeasuredChapter by remember { androidx.compose.runtime.mutableStateOf(-1) }
 
     val (bg, fg) = readingColors(state.prefs.readingTheme, state.prefs.appTheme)
     val mode = state.translationMode
@@ -69,6 +79,34 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
     }
     val primaryBlocks = remember(primaryHtml) { primaryHtml.toBlocks() }
     val secondaryBlocks = remember(secondaryHtml) { secondaryHtml.toBlocks() }
+    val listScrollRange = remember { mutableStateOf(0f) }
+    val blockStartIndex = if (mode != TranslationMode.ORIGINAL &&
+        chapter?.translatedContent == null &&
+        state.currentChapter !in state.translatingChapters
+    ) 2 else 1
+
+    // 等 LazyList 完成测量后拿到可滚动像素范围，保存与恢复使用同一个比例。
+    LaunchedEffect(listState, state.book, state.currentChapter, blockStartIndex) {
+        snapshotFlow { listState.layoutInfo.totalItemsCount to listState.layoutInfo.viewportSize }
+            .collectLatest {
+                listScrollRange.value = measureScrollRange(listState, blockStartIndex)
+                if (lastMeasuredBook != state.book || lastMeasuredChapter != state.currentChapter) {
+                    lastMeasuredBook = state.book
+                    lastMeasuredChapter = state.currentChapter
+                    val fraction = state.initialChapterScrollFraction
+                    if (fraction > 0f && listScrollRange.value > 0f) {
+                        listState.scrollBy(fraction * listScrollRange.value)
+                    }
+                }
+            }
+    }
+    LaunchedEffect(listState, state.book, state.currentChapter, blockStartIndex) {
+        snapshotFlow {
+            val range = listScrollRange.value
+            if (range <= 0f) 0f
+            else (listState.firstVisibleItemScrollOffset.toFloat() / range).coerceIn(0f, 1f)
+        }.collectLatest { app.setChapterScrollFraction(state.currentChapter, it) }
+    }
 
     Box(modifier = modifier.background(bg)) {
         when {
@@ -216,6 +254,24 @@ private fun CenterHint(text: String, color: Color) {
 
 private fun String?.toBlocks(): List<RichBlock> =
     this?.let { htmlToRichBlocks(stripInlineImageMarkers(it)) } ?: emptyList()
+
+/** 通过临时滚动测量完整列表，再回到原位置；不改动持久化进度。 */
+private suspend fun measureScrollRange(
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    contentStartIndex: Int,
+): Float {
+    val originalIndex = listState.firstVisibleItemIndex
+    val originalOffset = listState.firstVisibleItemScrollOffset
+    return try {
+        val total = listState.layoutInfo.totalItemsCount
+        if (total <= contentStartIndex) return 0f
+        listState.scrollToItem(total - 1)
+        val last = listState.layoutInfo.visibleItemsInfo.lastOrNull() ?: return 0f
+        (last.offset + last.size - listState.layoutInfo.viewportEndOffset).coerceAtLeast(0).toFloat()
+    } finally {
+        listState.scrollToItem(originalIndex, originalOffset)
+    }
+}
 
 private fun primaryHtml(chapter: Chapter?, mode: TranslationMode): String? {
     if (chapter == null) return null

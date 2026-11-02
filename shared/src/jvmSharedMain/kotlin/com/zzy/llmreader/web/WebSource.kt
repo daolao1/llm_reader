@@ -15,11 +15,27 @@ import okhttp3.TlsVersion
 import okhttp3.dnsoverhttps.DnsOverHttps
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 
 /** 抓取进度回调；total 为 -1 表示总数未知。 */
 typealias FetchProgress = (current: Int, total: Int, label: String) -> Unit
+
+private const val CONTENT_BLOCKS = "p, h1, h2, h3, h4, blockquote, pre"
+
+/**
+ * 保留正文顶层块，丢弃已被某个选中祖先包含的块。
+ * 例如 blockquote 内含 p 时，若两者都 outerHtml 后拼接，引用会被翻译两遍。
+ */
+internal fun topLevelContentBlocks(root: Element): List<Element> {
+    val selected = root.select(CONTENT_BLOCKS)
+    val selectedSet = selected.toSet()
+    return selected.filter { element ->
+        element.parents().none { it in selectedSet } &&
+            (element.text().isNotBlank() || element.html().contains("<br", ignoreCase = true))
+    }
+}
 
 /** 调用方可以识别它 → 弹出 CF 验证 Activity。 */
 class CloudflareBlockedException(
@@ -318,7 +334,7 @@ abstract class HtmlWebSource : WebSource {
     }
 }
 
-    /**
+/**
  * 站点连接允许的 TLS 版本。
  *
  * ⚠️ **TLS 1.2 不能删**。本工程已移除 Conscrypt（四个 ABI 原生库占了 APK 的 80%），

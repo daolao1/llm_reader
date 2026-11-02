@@ -221,10 +221,7 @@ class Ao3Source(
             "script, style, noscript, iframe, svg, form, button, input, select, textarea, " +
                 "[class*=feedback], [class*=kudos]",
         ).remove()
-        val paragraphs = article.select("p, h1, h2, h3, h4, blockquote, pre")
-            .filter { p ->
-                p.text().isNotBlank() || p.html().contains("<br", ignoreCase = true)
-            }
+        val paragraphs = topLevelContentBlocks(article)
         val html = if (paragraphs.isNotEmpty()) {
             paragraphs.joinToString("\n") { it.outerHtml() }
         } else {

@@ -98,6 +98,9 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     /** 详情页选中的章节：openBook/openWebBook 完成后跳到该章。 */
     private var pendingInitialChapter: Int? = null
 
+    /** 只允许最后一次打开请求落地，避免慢解析/抓取覆盖后来打开的书。 */
+    private var openGeneration = 0L
+
     internal val _state = MutableStateFlow(ReaderUiState())
     val state: StateFlow<ReaderUiState> = _state.asStateFlow()
 
@@ -139,6 +142,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openBook(uri: Uri, takePersistableFlags: Int = Intent.FLAG_GRANT_READ_URI_PERMISSION) {
+        val generation = ++openGeneration
         viewModelScope.launch {
             _state.update { it.copy(loading = true, loadingText = "解析中…", error = null) }
             runCatching {
@@ -149,7 +153,9 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { parser.parse(AndroidBookSource(getApplication(), uri)) }
             }
             parsed.onSuccess { book ->
+                if (generation != openGeneration) return@onSuccess
                 val saved = progressRepo.get(uri.toString())
+                if (generation != openGeneration) return@onSuccess
                 val totalChapters = ((book as? BookContent.Text)?.chapters?.size ?: 1)
                 val override = pendingInitialChapter
                 pendingInitialChapter = null
@@ -187,6 +193,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                     ensureChapterTranslated(startIdx)
                 }
             }.onFailure { err ->
+                if (generation != openGeneration) return@onFailure
                 Log.e(TAG, "parse failed", err)
                 _state.update { it.copy(loading = false, error = err.message ?: "解析失败") }
             }
@@ -194,6 +201,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openWebBook(inputUrl: String, forceRefresh: Boolean = false) {
+        val generation = ++openGeneration
         viewModelScope.launch {
             val source = webRegistry.find(inputUrl)
             if (source == null) {
@@ -231,7 +239,9 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             loaded.onSuccess { book ->
+                if (generation != openGeneration) return@onSuccess
                 val saved = progressRepo.get(book.url)
+                if (generation != openGeneration) return@onSuccess
                 val override = pendingInitialChapter
                 pendingInitialChapter = null
                 val startIdx = override?.coerceIn(0, (book.chapters.size - 1).coerceAtLeast(0))
@@ -282,6 +292,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                     refreshTocMetadataInBackground(book.url, source)
                 }
             }.onFailure { err ->
+                if (generation != openGeneration) return@onFailure
                 Log.e(TAG, "web book failed", err)
                 if (err is CloudflareBlockedException) {
                     _state.update {
@@ -340,27 +351,26 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
 
             result.onSuccess { updated ->
                 _state.update { state ->
-                    val newBook = updated.toBookContent()
-                    state.copy(
-                        book = newBook,
+                    // 抓取可能跨越关书/换书；迟到的旧书结果不得污染当前界面。
+                    if (state.webCanonicalUrl != canonical) state
+                    else state.copy(
+                        book = updated.toBookContent(),
                         loadingChapters = state.loadingChapters - index,
                     )
                 }
             }.onFailure { err ->
                 Log.e(TAG, "chapter $index fetch failed", err)
-                if (err is CloudflareBlockedException) {
-                    _state.update {
-                        it.copy(
-                            loadingChapters = it.loadingChapters - index,
+                _state.update { state ->
+                    if (state.webCanonicalUrl != canonical) return@update state
+                    if (err is CloudflareBlockedException) {
+                        state.copy(
+                            loadingChapters = state.loadingChapters - index,
                             error = "需要重新通过 Cloudflare 验证。",
                             pendingCloudflareUrl = err.targetUrl,
-                        )
-                    }
-                    pendingChapterReload = index
-                } else {
-                    _state.update {
-                        it.copy(
-                            loadingChapters = it.loadingChapters - index,
+                        ).also { pendingChapterReload = index }
+                    } else {
+                        state.copy(
+                            loadingChapters = state.loadingChapters - index,
                             error = err.message ?: "章节加载失败",
                         )
                     }
@@ -441,9 +451,10 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         val sourceId = cur.webSourceId ?: return
         if (cur.tocRefreshing) return
         val source = webRegistry.findById(sourceId) ?: return
-
         _state.update { it.copy(tocRefreshing = true) }
         viewModelScope.launch {
+            val currentChapterUrl = withContext(Dispatchers.IO) { webCache.read(canonical) }
+                ?.chapters?.getOrNull(cur.currentChapter)?.chapterUrl
             val result = runCatching {
                 val fresh = source.fetchIndex(canonical) { _, _, _ -> }
                 cacheMutex.withLock {
@@ -480,8 +491,10 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                     } else {
                         state.copy(
                             book = updated.toBookContent(),
-                            // 目录可能增删，把当前章夹回合法范围
-                            currentChapter = state.currentChapter
+                            // 目录可能增删，按稳定 URL 找回原章，不能让旧下标指向另一章。
+                            currentChapter = currentChapterUrl?.let { url ->
+                                updated.chapters.indexOfFirst { it.chapterUrl == url }.takeIf { it >= 0 }
+                            } ?: state.currentChapter
                                 .coerceIn(0, (updated.chapters.size - 1).coerceAtLeast(0)),
                             error = null,
                         )
@@ -489,6 +502,12 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }.onFailure { e ->
                 _state.update { it.copy(error = "刷新目录失败：${e.message}") }
+            }
+            val correctedIndex = _state.value.currentChapter
+            if (_state.value.webCanonicalUrl == canonical) {
+                viewModelScope.launch {
+                    progressRepo.save(canonical, correctedIndex, _state.value.initialChapterScrollFraction)
+                }
             }
             _state.update { it.copy(tocRefreshing = false) }
         }
@@ -1254,6 +1273,7 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun closeBook() {
+        openGeneration++
         currentBookKey = null
         cancelAllTranslationJobs()
         _state.update {

@@ -33,6 +33,7 @@ fun defaultDesktopDirs(): AppDirs {
 data class DesktopUiState(
     val book: BookContent.Text? = null,
     val currentChapter: Int = 0,
+    val initialChapterScrollFraction: Float = 0f,
     val fontScale: Float = 1f,
     val loading: Boolean = false,
     val loadingText: String = "",
@@ -65,6 +66,9 @@ class DesktopAppState(
     val state: StateFlow<DesktopUiState> = _state.asStateFlow()
 
     private val webRegistry = core.createWebRegistry { _state.value.prefs }
+
+    /** 打开请求代次：后一次请求优先，旧请求即使更晚完成也不能换书。 */
+    private var openGeneration = 0L
 
     /** 当前这本书的进度 key：本地书 = 文件绝对路径，网页书 = canonical url。 */
     private var currentBookKey: String? = null
@@ -108,20 +112,24 @@ class DesktopAppState(
     // ---------------------------------------------------------------- 打开
 
     fun openLocalFile(file: File) {
+        val generation = ++openGeneration
         scope.launch {
             _state.update { it.copy(loading = true, loadingText = "解析中…", error = null) }
             val result = withContext(Dispatchers.IO) {
                 runCatching { core.documentParser.parse(FileBookSource(file)) }
             }
             result.onSuccess { book ->
+                if (generation != openGeneration) return@onSuccess
                 when (book) {
                     is BookContent.Text -> {
                         val saved = withContext(Dispatchers.IO) { core.progressRepo.get(file.absolutePath) }
+                        if (generation != openGeneration) return@onSuccess
                         show(
                             book,
                             canonical = null,
                             sourceId = null,
                             startChapter = saved?.chapterIndex ?: 0,
+                            startScrollFraction = saved?.chapterScrollFraction ?: 0f,
                             localKey = file.absolutePath,
                         )
                         remember(file.absolutePath, book.title, RecentBookSource.FILE)
@@ -131,12 +139,14 @@ class DesktopAppState(
                     }
                 }
             }.onFailure { e ->
+                if (generation != openGeneration) return@onFailure
                 _state.update { it.copy(loading = false, error = e.message ?: "打开失败") }
             }
         }
     }
 
     fun openWebBook(input: String, forceRefresh: Boolean = false) {
+        val generation = ++openGeneration
         val url = input.trim()
         if (url.isBlank()) return
         val source = webRegistry.find(url)
@@ -162,19 +172,25 @@ class DesktopAppState(
                 }
                 if (cached == null) withContext(Dispatchers.IO) { core.webCache.write(book) }
                 val saved = withContext(Dispatchers.IO) { core.progressRepo.get(book.url) }
-                book to (saved?.chapterIndex ?: 0)
-            }.onSuccess { (book, startChapter) ->
+                if (generation != openGeneration) return@runCatching null
+                    book to ((saved?.chapterIndex ?: 0) to (saved?.chapterScrollFraction ?: 0f))
+            }.onSuccess { result ->
+                if (generation != openGeneration) return@onSuccess
+                val (book, position) = result ?: return@onSuccess
+                val (startChapter, startScrollFraction) = position
                 show(
                     book.toBookContent(),
                     canonical = book.url,
                     sourceId = book.source,
                     startChapter = startChapter,
+                    startScrollFraction = startScrollFraction,
                 )
                 remember(book.url, book.title, RecentBookSource.WEB)
                 // 打开后先把当前章正文拉下来，并按设置预取后续章节
                 ensureChapterLoaded(_state.value.currentChapter)
                 prefetchAround(_state.value.currentChapter)
             }.onFailure { e ->
+                if (generation != openGeneration) return@onFailure
                 _state.update {
                     it.copy(loading = false, error = friendlyFetchError(e, source.displayName))
                 }
@@ -205,6 +221,7 @@ class DesktopAppState(
         canonical: String?,
         sourceId: String?,
         startChapter: Int,
+        startScrollFraction: Float = 0f,
         /** 本地书的进度 key（绝对路径）。网页书传 null，用 canonical。 */
         localKey: String? = null,
     ) {
@@ -215,6 +232,7 @@ class DesktopAppState(
             it.copy(
                 book = book,
                 currentChapter = idx,
+                initialChapterScrollFraction = startScrollFraction.coerceIn(0f, 1f),
                 loading = false,
                 error = null,
                 webCanonicalUrl = canonical,
@@ -228,6 +246,8 @@ class DesktopAppState(
     }
 
     fun closeBook() {
+        saveProgress()
+        openGeneration++
         cancelTranslationJobs()
         chapterFetchJobs.values.forEach { it.cancel() }
         chapterFetchJobs.clear()
@@ -267,7 +287,7 @@ class DesktopAppState(
     fun selectChapter(index: Int) {
         val st = _state.value
         if (index !in 0 until st.chapterCount) return
-        _state.update { it.copy(currentChapter = index) }
+        _state.update { it.copy(currentChapter = index, initialChapterScrollFraction = 0f) }
         saveProgress()
         ensureChapterLoaded(index)
         prefetchAround(index)
@@ -315,8 +335,18 @@ class DesktopAppState(
         // 每次重开都回到开头。
         val key = currentBookKey ?: return
         scope.launch {
-            runCatching { core.progressRepo.save(key, st.currentChapter, 0f) }
+            runCatching { core.progressRepo.save(key, st.currentChapter, st.initialChapterScrollFraction) }
         }
+    }
+
+    /** 阅读区报告实际滚动位置；只在变化达到 1% 时写盘。 */
+    fun setChapterScrollFraction(index: Int, fraction: Float) {
+        val st = _state.value
+        if (st.currentChapter != index || st.book == null) return
+        val value = fraction.coerceIn(0f, 1f)
+        if (kotlin.math.abs(value - st.initialChapterScrollFraction) < 0.01f) return
+        _state.update { it.copy(initialChapterScrollFraction = value) }
+        saveProgress()
     }
 
     /** 网页小说：按需抓取单章正文。 */

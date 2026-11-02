@@ -130,8 +130,7 @@ class ScribbleHubSource(
             "script, style, noscript, iframe, svg, form, button, input, select, textarea, " +
                 "[class*=ad], [class*=banner], [id*=banner]",
         ).remove()
-        val paragraphs = raw.select("p, h1, h2, h3, h4, blockquote, pre")
-            .filter { it.text().isNotBlank() || it.html().contains("<br", ignoreCase = true) }
+        val paragraphs = topLevelContentBlocks(raw)
         val html = if (paragraphs.isNotEmpty()) {
             paragraphs.joinToString("\n") { it.outerHtml() }
         } else {
