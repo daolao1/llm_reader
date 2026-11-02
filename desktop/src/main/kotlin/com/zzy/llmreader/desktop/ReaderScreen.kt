@@ -3,6 +3,7 @@ package com.zzy.llmreader.desktop
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,7 +11,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.MenuBook
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Surface
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -49,7 +60,16 @@ import com.zzy.llmreader.model.Chapter
 import kotlinx.coroutines.flow.collectLatest
 
 @Composable
-fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier = Modifier) {
+fun ReaderScreen(
+    state: DesktopUiState,
+    app: DesktopAppState,
+    chromeVisible: Boolean,
+    onToggleChrome: () -> Unit,
+    onBack: () -> Unit,
+    onShowToc: () -> Unit,
+    onShowSettings: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val chapter = state.current
     val listState = rememberLazyListState()
 
@@ -64,6 +84,7 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
     var lastMeasuredChapter by remember { androidx.compose.runtime.mutableStateOf(-1) }
 
     val (bg, fg) = readingColors(state.prefs.readingTheme, state.prefs.appTheme)
+    val canvas = if (state.prefs.readingTheme == ReadingTheme.NIGHT) Color(0xFF20221F) else bg
     val mode = state.translationMode
 
     val primaryHtml = remember(chapter, mode) { primaryHtml(chapter, mode) }
@@ -108,7 +129,7 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
         }.collectLatest { app.setChapterScrollFraction(state.currentChapter, it) }
     }
 
-    Box(modifier = modifier.background(bg)) {
+    Box(modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerLow)) {
         when {
             chapter == null -> CenterHint("没有章节内容", fg)
             state.currentChapter in state.loadingChapters -> {
@@ -122,26 +143,38 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
             }
             primaryBlocks.isEmpty() -> CenterHint("本章暂无正文", fg)
             else -> Column(Modifier.fillMaxSize()) {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                        horizontal = 40.dp,
-                        vertical = 28.dp,
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
+                BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                    val contentWidth = (maxWidth - 48.dp).coerceAtMost(840.dp)
+                    Surface(
+                        modifier = Modifier.fillMaxSize().width(contentWidth).align(Alignment.TopCenter),
+                        color = canvas,
+                        shape = RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp),
+                    ) {
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                horizontal = 48.dp, vertical = 36.dp,
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(14.dp),
+                        ) {
                     if (mode != TranslationMode.ORIGINAL &&
                         chapter.translatedContent == null &&
                         state.currentChapter !in state.translatingChapters
                     ) {
                         item {
-                            Text(
-                                "这一章还没有译文，显示的是原文。" +
-                                    "点工具栏的「翻译本章」开始翻译。",
-                                color = fg.copy(alpha = 0.7f),
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = fg.copy(alpha = .06f),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    "本章尚未翻译，当前显示原文。打开阅读面板即可开始翻译。",
+                                    color = fg.copy(alpha = .75f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+                                )
+                            }
                         }
                     }
                     item {
@@ -152,28 +185,94 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
                             text = title,
                             color = fg,
                             style = MaterialTheme.typography.headlineSmall,
-                            modifier = Modifier.padding(bottom = 10.dp),
+                            fontFamily = SerifReading,
+                            modifier = Modifier.padding(bottom = 18.dp),
                         )
                     }
                     itemsIndexed(primaryBlocks) { _, block ->
                         RichBlockView(block, fg, state.fontScale)
                     }
-                    if (secondaryBlocks.isNotEmpty()) {
-                        item {
-                            Spacer(Modifier.height(20.dp))
-                            Text(
-                                text = "—— 原文 ——",
-                                color = fg.copy(alpha = 0.55f),
-                                style = MaterialTheme.typography.labelLarge,
-                            )
-                            Spacer(Modifier.height(8.dp))
-                        }
+                        if (secondaryBlocks.isNotEmpty()) {
+                            item {
+                                Spacer(Modifier.height(24.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Spacer(Modifier.width(1.dp).height(18.dp).background(fg.copy(alpha = .3f)))
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(
+                                        text = "原文对照",
+                                        color = fg.copy(alpha = .6f),
+                                        style = MaterialTheme.typography.labelLarge,
+                                    )
+                                }
+                                Spacer(Modifier.height(10.dp))
+                            }
                         itemsIndexed(secondaryBlocks) { _, block ->
                             RichBlockView(block, fg.copy(alpha = 0.72f), state.fontScale * 0.94f)
+                        }
+                        }
                         }
                     }
                 }
                 ChapterNavBar(state = state, app = app, fg = fg)
+            }
+        }
+        if (chromeVisible) {
+            ReaderFloatingTools(
+                state = state,
+                onBack = onBack,
+                onShowToc = onShowToc,
+                onShowSettings = onShowSettings,
+            )
+        } else {
+            Surface(
+                onClick = onToggleChrome,
+                shape = RoundedCornerShape(50),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = .75f),
+                modifier = Modifier.align(Alignment.BottomCenter).padding(20.dp),
+            ) {
+                Text("轻点显示阅读工具", style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        // 中央空白阅读区用于切换沉浸模式；文字和按钮仍可正常点击。
+        if (chromeVisible) {
+            Box(Modifier.align(Alignment.Center).clickable(onClick = onToggleChrome))
+        }
+    }
+}
+
+@Composable
+private fun ReaderFloatingTools(
+    state: DesktopUiState,
+    onBack: () -> Unit,
+    onShowToc: () -> Unit,
+    onShowSettings: () -> Unit,
+) {
+    Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp)) {
+        Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surface.copy(alpha = .92f),
+            shadowElevation = 4.dp) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回书架")
+            }
+        }
+        Surface(
+            shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f),
+            shadowElevation = 4.dp, modifier = Modifier.align(Alignment.TopCenter),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onShowToc) {
+                    Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = "打开目录")
+                }
+                Text(
+                    state.current?.translatedTitle ?: state.current?.title.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    modifier = Modifier.widthIn(max = 250.dp),
+                )
+                IconButton(onClick = onShowSettings) {
+                    Icon(Icons.Default.Tune, contentDescription = "阅读设置")
+                }
             }
         }
     }
@@ -181,29 +280,36 @@ fun ReaderScreen(state: DesktopUiState, app: DesktopAppState, modifier: Modifier
 
 @Composable
 private fun ChapterNavBar(state: DesktopUiState, app: DesktopAppState, fg: Color) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 40.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        OutlinedButton(
-            onClick = { app.prevChapter() },
-            enabled = state.currentChapter > 0,
-        ) { Text("上一章") }
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 12.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            OutlinedButton(
+                onClick = { app.prevChapter() },
+                enabled = state.currentChapter > 0,
+                shape = RoundedCornerShape(10.dp),
+            ) { Text("← 上一章") }
 
-        Text(
-            text = "${state.currentChapter + 1} / ${state.chapterCount}",
-            color = fg,
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.weight(1f),
-        )
+            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    text = "第 ${state.currentChapter + 1} 章 / 共 ${state.chapterCount} 章",
+                    color = fg,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(6.dp))
+                androidx.compose.material3.LinearProgressIndicator(
+                    progress = { ((state.currentChapter + 1f) / state.chapterCount.coerceAtLeast(1)).coerceIn(0f, 1f) },
+                    modifier = Modifier.widthIn(max = 220.dp).fillMaxWidth(),
+                )
+            }
 
-        OutlinedButton(
-            onClick = { app.nextChapter() },
-            enabled = state.currentChapter < state.chapterCount - 1,
-        ) { Text("下一章") }
+            OutlinedButton(
+                onClick = { app.nextChapter() },
+                enabled = state.currentChapter < state.chapterCount - 1,
+                shape = RoundedCornerShape(10.dp),
+            ) { Text("下一章 →") }
+        }
     }
 }
 
@@ -230,8 +336,9 @@ private fun RichBlockView(block: RichBlock, color: Color, fontScale: Float) {
     Text(
         text = annotated,
         color = color,
-        modifier = Modifier.fillMaxWidth().widthIn(max = 900.dp),
+        modifier = Modifier.fillMaxWidth(),
         style = TextStyle(
+            fontFamily = SerifReading,
             fontSize = (baseSize * fontScale).sp,
             lineHeight = (baseSize * fontScale * 1.75f).sp,
             fontWeight = if (block.heading > 0) FontWeight.SemiBold else FontWeight.Normal,

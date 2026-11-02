@@ -246,16 +246,19 @@ fun ReaderApp(
                 TopAppBar(
                 title = {
                     Text(
-                        text = state.book?.title ?: "LLM Reader",
+                        text = state.book?.title ?: "我的书房",
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                 },
                 navigationIcon = {
                     if (state.book != null) {
-                        TextButton(onClick = {
-                            // \u201c\u4e66\u5e93\"\u6309\u94ae\u660e\u786e\u662f\u53bb\u4e66\u5e93\uff0c\u4e0d\u56de\u53d1\u73b0\u9875\uff1b\u53d1\u73b0\u8fd4\u56de\u53ea\u9760\u7cfb\u7edf back\u3002\n                            returnToDiscovery = false\n                            viewModel.closeBook()
-                        }) { Text("书库") }
+                        IconButton(onClick = {
+                            returnToDiscovery = false
+                            viewModel.closeBook()
+                        }) {
+                            Icon(Icons.Default.AutoStories, contentDescription = "返回书架")
+                        }
                     }
                 },
                 actions = {
@@ -667,7 +670,7 @@ private fun LoadingBox(padding: PaddingValues, label: String) {
             CircularProgressIndicator()
             Spacer(Modifier.height(16.dp))
             Text(
-                label,
+                label.ifBlank { "正在准备你的书籍…" },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -702,6 +705,18 @@ private fun LibraryScreen(
             .padding(padding)
             .padding(horizontal = 16.dp),
     ) {
+        Text(
+            if (recents.isEmpty()) "把故事，读成自己的模样。" else "欢迎回来，接着读吧。",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(top = 24.dp, start = 4.dp, end = 4.dp),
+        )
+        Text(
+            "本地书籍与在线小说，在一处安静阅读。",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 6.dp, bottom = 18.dp, start = 4.dp, end = 4.dp),
+        )
         // 必填项还没填时，把入口直接摆到书库页 —— 否则用户要翻译时才发现没配置，
         // 而设置面板里有十几个字段，不知道该填哪几个。
         if (!llmConfigured) {
@@ -729,12 +744,36 @@ private fun LibraryScreen(
             }
         }
         Text(
-            "本地格式：TXT · Markdown · HTML · EPUB · PDF\n" +
-                "网站支持：Literotica · Syosetu/Novel18 · AO3 · Pixiv · Hameln · Kakuyomu · ScribbleHub · Royal Road",
+            "支持 TXT、Markdown、HTML、EPUB、PDF，以及 8 个在线小说站点。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 12.dp, bottom = 8.dp),
         )
+        if (recents.isNotEmpty()) {
+            val latest = recents.first()
+            Surface(
+                onClick = { onOpenRecent(latest) },
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 17.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Default.AutoStories, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("继续阅读《${latest.title}》", style = MaterialTheme.typography.titleSmall,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("从上次停下的地方接着读", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .75f))
+                    }
+                    Text("开始", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
         if (recents.isEmpty()) {
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -781,8 +820,8 @@ private fun LibraryScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "书库",
-                    style = MaterialTheme.typography.titleMedium,
+                    "最近阅读",
+                    style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.weight(1f),
                 )
                 Text(
@@ -850,9 +889,9 @@ private fun RecentItem(
     onDelete: () -> Unit,
     onShowDetail: () -> Unit = {},
 ) {
-    val df = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
+    val df = remember { SimpleDateFormat("M月d日 HH:mm", Locale.getDefault()) }
     val isWeb = book.source == RecentBookSource.WEB || book.uri.startsWith("http", ignoreCase = true)
-    val sourceLabel = if (isWeb) "网页缓存" else "本地文件"
+    val sourceLabel = if (isWeb) "在线" else "本地"
     val sourceIcon = if (isWeb) Icons.Default.Language else Icons.Default.InsertDriveFile
     val hint = remember(book.uri) {
         if (isWeb) {
@@ -864,7 +903,10 @@ private fun RecentItem(
     ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
         onClick = onClick,
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+        colors = androidx.compose.material3.CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+        ),
     ) {
         Row(
             modifier = Modifier
@@ -872,7 +914,7 @@ private fun RecentItem(
                 .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // 渐变彩色"封面"+ 来源小图标徽章
+            // 低饱和书封，保留区分度但不喧宾夺主。
             val palette = remember(book.title) { recentPalette(book.title) }
             Box(
                 modifier = Modifier
@@ -948,13 +990,13 @@ private fun RecentItem(
 
 private fun recentPalette(seed: String): Pair<androidx.compose.ui.graphics.Color, androidx.compose.ui.graphics.Color> {
     val palettes = listOf(
-        androidx.compose.ui.graphics.Color(0xFF6A11CB) to androidx.compose.ui.graphics.Color(0xFF2575FC),
-        androidx.compose.ui.graphics.Color(0xFFEE0979) to androidx.compose.ui.graphics.Color(0xFFFF6A00),
-        androidx.compose.ui.graphics.Color(0xFF134E5E) to androidx.compose.ui.graphics.Color(0xFF71B280),
-        androidx.compose.ui.graphics.Color(0xFFFF512F) to androidx.compose.ui.graphics.Color(0xFFDD2476),
-        androidx.compose.ui.graphics.Color(0xFF1F4037) to androidx.compose.ui.graphics.Color(0xFF99F2C8),
-        androidx.compose.ui.graphics.Color(0xFF373B44) to androidx.compose.ui.graphics.Color(0xFF4286F4),
-        androidx.compose.ui.graphics.Color(0xFF8E2DE2) to androidx.compose.ui.graphics.Color(0xFF4A00E0),
+        androidx.compose.ui.graphics.Color(0xFF648472) to androidx.compose.ui.graphics.Color(0xFF3E5C50),
+        androidx.compose.ui.graphics.Color(0xFFAA8D6C) to androidx.compose.ui.graphics.Color(0xFF766044),
+        androidx.compose.ui.graphics.Color(0xFF7F8FA0) to androidx.compose.ui.graphics.Color(0xFF526373),
+        androidx.compose.ui.graphics.Color(0xFFAC8C83) to androidx.compose.ui.graphics.Color(0xFF785F57),
+        androidx.compose.ui.graphics.Color(0xFF86957C) to androidx.compose.ui.graphics.Color(0xFF53634C),
+        androidx.compose.ui.graphics.Color(0xFF92869C) to androidx.compose.ui.graphics.Color(0xFF65586F),
+        androidx.compose.ui.graphics.Color(0xFF729395) to androidx.compose.ui.graphics.Color(0xFF49676A),
     )
     val idx = kotlin.math.abs(seed.hashCode()) % palettes.size
     return palettes[idx]

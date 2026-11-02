@@ -18,38 +18,41 @@ import androidx.compose.ui.unit.sp
 import com.zzy.llmreader.data.AppTheme
 import com.zzy.llmreader.data.ReaderFontFamily
 
-// 暖色调，类似纸张，更适合长时间阅读
+// 安静、温暖的现代书房：低饱和墨绿、纸张色与柔和层级，适合长时间阅读。
 private val LightColors = lightColorScheme(
-    primary = Color(0xFF6B5B95),
+    primary = Color(0xFF426457),
     onPrimary = Color.White,
-    primaryContainer = Color(0xFFE9DFFF),
-    onPrimaryContainer = Color(0xFF22134D),
-    secondary = Color(0xFFA67C52),
+    primaryContainer = Color(0xFFDCE9DE),
+    onPrimaryContainer = Color(0xFF1B372A),
+    secondary = Color(0xFF8B6B4A),
     onSecondary = Color.White,
-    secondaryContainer = Color(0xFFF5E6D3),
-    onSecondaryContainer = Color(0xFF3B2412),
-    tertiary = Color(0xFF7A9E7E),
-    background = Color(0xFFFBF7F0), // 米黄色阅读底
-    onBackground = Color(0xFF26211C),
-    surface = Color(0xFFFBF7F0),
-    onSurface = Color(0xFF26211C),
-    surfaceVariant = Color(0xFFEDE6D8),
-    onSurfaceVariant = Color(0xFF5A544A),
-    outline = Color(0xFFB8AE9F),
+    secondaryContainer = Color(0xFFF0E5D3),
+    onSecondaryContainer = Color(0xFF49351E),
+    tertiary = Color(0xFF66778E),
+    background = Color(0xFFF7F5EF),
+    onBackground = Color(0xFF26332E),
+    surface = Color(0xFFF7F5EF),
+    onSurface = Color(0xFF26332E),
+    surfaceVariant = Color(0xFFE9E9DF),
+    onSurfaceVariant = Color(0xFF667068),
+    outline = Color(0xFFC8CEC3),
+    outlineVariant = Color(0xFFE0E3D9),
 )
 
 private val DarkColors = darkColorScheme(
-    primary = Color(0xFFB9A3FF),
-    onPrimary = Color(0xFF1B0F46),
-    primaryContainer = Color(0xFF463078),
-    onPrimaryContainer = Color(0xFFE9DFFF),
-    secondary = Color(0xFFD7B89A),
-    background = Color(0xFF1A1714),
-    onBackground = Color(0xFFEAE2D5),
-    surface = Color(0xFF1A1714),
-    onSurface = Color(0xFFEAE2D5),
-    surfaceVariant = Color(0xFF3B342C),
-    onSurfaceVariant = Color(0xFFCDC3B2),
+    primary = Color(0xFFA9CDB5),
+    onPrimary = Color(0xFF173123),
+    primaryContainer = Color(0xFF324D3D),
+    onPrimaryContainer = Color(0xFFE0EFE1),
+    secondary = Color(0xFFD8BD94),
+    secondaryContainer = Color(0xFF493D2C),
+    onSecondaryContainer = Color(0xFFF3E4CB),
+    background = Color(0xFF171D19),
+    onBackground = Color(0xFFE0E7DB),
+    surface = Color(0xFF171D19),
+    onSurface = Color(0xFFE0E7DB),
+    surfaceVariant = Color(0xFF2A352D),
+    onSurfaceVariant = Color(0xFFB2BDB0),
 )
 
 private val ReaderTypography = Typography(

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -48,9 +49,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.NavigateBefore
-import androidx.compose.material.icons.filled.NavigateNext
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
@@ -110,7 +109,6 @@ fun TextReader(
     onScrollFractionChange: (Int, Float) -> Unit = { _, _ -> },
 ) {
     var showToc by remember { mutableStateOf(false) }
-    var showMenu by remember { mutableStateOf(false) }
     var showFontMenu by remember { mutableStateOf(false) }
     val safeIndex = currentChapter.coerceIn(0, (book.chapters.size - 1).coerceAtLeast(0))
     val chapter = book.chapters.getOrNull(safeIndex)
@@ -237,7 +235,16 @@ fun TextReader(
             enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
             exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
         ) {
-            // 留空：底栏改为右下角悬浮球菜单（见外层 Box）
+            ReaderBottomBar(
+                chapterIndex = safeIndex,
+                chapterTotal = book.chapters.size,
+                fontScale = fontScale,
+                readingTheme = readingTheme,
+                onShowToc = { showToc = true },
+                onAsk = onAskClicked,
+                onSetFontScale = onSetFontScale,
+                onCycleTheme = onCycleTheme,
+            )
         }
       }
 
@@ -258,56 +265,53 @@ fun TextReader(
             )
         }
 
-        // 右下角悬浮球菜单
-        AnimatedVisibility(
-            visible = chromeVisible,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier
-                .align(androidx.compose.ui.Alignment.BottomEnd)
-                .windowInsetsPadding(
-                    androidx.compose.foundation.layout.WindowInsets.safeDrawing
-                        .only(WindowInsetsSides.Bottom + WindowInsetsSides.End)
-                )
-                .padding(end = 16.dp, bottom = 24.dp),
-        ) {
-            ReaderFab(
-                expanded = showMenu,
-                onToggle = { showMenu = !showMenu },
-                hasPrev = safeIndex > 0,
-                hasNext = safeIndex < book.chapters.size - 1,
-                readingTheme = readingTheme,
-                onPrev = {
-                    if (safeIndex > 0) onSelectChapter(safeIndex - 1)
-                    showMenu = false
-                },
-                onNext = {
-                    if (safeIndex < book.chapters.size - 1) onSelectChapter(safeIndex + 1)
-                    showMenu = false
-                },
-                onShowToc = { showToc = true; showMenu = false },
-                onFont = { showFontMenu = true; showMenu = false },
-                onTheme = { onCycleTheme(); showMenu = false },
-                onAsk = { onAskClicked(); showMenu = false },
-            )
-        }
+        // 阅读操作集中在底部面板，避免多个悬浮球遮挡正文。
     }
 
     if (showFontMenu) {
         AlertDialog(
             onDismissRequest = { showFontMenu = false },
             confirmButton = { TextButton(onClick = { showFontMenu = false }) { Text("完成") } },
-            title = { Text("调整字号") },
+            title = { Text("阅读设置") },
             text = {
-                Column {
-                    Text("当前缩放：${"%.1f".format(fontScale)}x")
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                    ) {
-                        Button(onClick = { onSetFontScale(fontScale - 0.1f) }) { Text("A-") }
-                        Button(onClick = { onSetFontScale(1f) }) { Text("100%") }
-                        Button(onClick = { onSetFontScale(fontScale + 0.1f) }) { Text("A+") }
+                Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    Text("调到眼睛舒服的程度，设置会自动保存。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Icon(Icons.Default.FormatSize, contentDescription = null)
+                        Spacer(Modifier.width(10.dp))
+                        Text("正文字号", modifier = Modifier.weight(1f))
+                        TextButton(onClick = { onSetFontScale(fontScale - 0.1f) }) { Text("A−") }
+                        Text("${(fontScale * 100).toInt()}%", style = MaterialTheme.typography.labelMedium)
+                        TextButton(onClick = { onSetFontScale(fontScale + 0.1f) }) { Text("A+") }
+                    }
+                    Text("阅读纸张", style = MaterialTheme.typography.labelMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        ReadingTheme.entries.forEach { theme ->
+                            Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
+                                androidx.compose.material3.Surface(
+                                    onClick = { if (theme != readingTheme) onCycleTheme() },
+                                    shape = androidx.compose.foundation.shape.CircleShape,
+                                    color = when (theme) {
+                                        ReadingTheme.DAY -> androidx.compose.ui.graphics.Color(0xFFFCFAF2)
+                                        ReadingTheme.SEPIA -> androidx.compose.ui.graphics.Color(0xFFE9DBC1)
+                                        ReadingTheme.NIGHT -> androidx.compose.ui.graphics.Color(0xFF20231F)
+                                    },
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        if (readingTheme == theme) 2.dp else 1.dp,
+                                        if (readingTheme == theme) MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.outline,
+                                    ),
+                                    modifier = Modifier.size(42.dp),
+                                ) {}
+                                Text(when (theme) {
+                                    ReadingTheme.DAY -> "明亮"
+                                    ReadingTheme.SEPIA -> "护眼"
+                                    ReadingTheme.NIGHT -> "夜间"
+                                }, style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
                     }
                 }
             },
@@ -340,8 +344,6 @@ private fun ReaderBottomBar(
     chapterTotal: Int,
     fontScale: Float,
     readingTheme: ReadingTheme,
-    onPrev: () -> Unit,
-    onNext: () -> Unit,
     onShowToc: () -> Unit,
     onAsk: () -> Unit,
     onSetFontScale: (Float) -> Unit,
@@ -378,40 +380,19 @@ private fun ReaderBottomBar(
                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
             ) {
                 BottomBarButton(
-                    icon = Icons.Default.NavigateBefore,
-                    label = "上一章",
-                    enabled = chapterIndex > 0,
-                    onClick = onPrev,
-                )
-                BottomBarButton(
                     icon = Icons.AutoMirrored.Filled.List,
                     label = "目录",
                     onClick = onShowToc,
                 )
                 BottomBarButton(
-                    icon = Icons.Default.FormatSize,
-                    label = "字号",
+                    icon = Icons.Default.Tune,
+                    label = "阅读设置",
                     onClick = { showFontMenu = true },
                 )
                 BottomBarButton(
-                    icon = Icons.Default.Brightness4,
-                    label = when (readingTheme) {
-                        ReadingTheme.DAY -> "白天"
-                        ReadingTheme.SEPIA -> "护眼"
-                        ReadingTheme.NIGHT -> "夜间"
-                    },
-                    onClick = onCycleTheme,
-                )
-                BottomBarButton(
                     icon = Icons.AutoMirrored.Filled.Chat,
-                    label = "问AI",
+                    label = "问 AI",
                     onClick = onAsk,
-                )
-                BottomBarButton(
-                    icon = Icons.Default.NavigateNext,
-                    label = "下一章",
-                    enabled = chapterIndex < chapterTotal - 1,
-                    onClick = onNext,
                 )
             }
         }
@@ -421,17 +402,46 @@ private fun ReaderBottomBar(
         AlertDialog(
             onDismissRequest = { showFontMenu = false },
             confirmButton = { TextButton(onClick = { showFontMenu = false }) { Text("完成") } },
-            title = { Text("调整字号") },
+            title = { Text("阅读设置") },
             text = {
-                Column {
-                    Text("当前缩放：${"%.1f".format(fontScale)}x")
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                    ) {
-                        Button(onClick = { onSetFontScale(fontScale - 0.1f) }) { Text("A-") }
-                        Button(onClick = { onSetFontScale(1f) }) { Text("100%") }
-                        Button(onClick = { onSetFontScale(fontScale + 0.1f) }) { Text("A+") }
+                Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    Text("调到眼睛舒服的程度，设置会自动保存。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Icon(Icons.Default.FormatSize, contentDescription = null)
+                        Spacer(Modifier.width(10.dp))
+                        Text("正文字号", modifier = Modifier.weight(1f))
+                        TextButton(onClick = { onSetFontScale(fontScale - 0.1f) }) { Text("A−") }
+                        Text("${(fontScale * 100).toInt()}%", style = MaterialTheme.typography.labelMedium)
+                        TextButton(onClick = { onSetFontScale(fontScale + 0.1f) }) { Text("A+") }
+                    }
+                    Text("阅读纸张", style = MaterialTheme.typography.labelMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        ReadingTheme.entries.forEach { theme ->
+                            Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
+                                androidx.compose.material3.Surface(
+                                    onClick = { if (theme != readingTheme) onCycleTheme() },
+                                    shape = androidx.compose.foundation.shape.CircleShape,
+                                    color = when (theme) {
+                                        ReadingTheme.DAY -> androidx.compose.ui.graphics.Color(0xFFFCFAF2)
+                                        ReadingTheme.SEPIA -> androidx.compose.ui.graphics.Color(0xFFE9DBC1)
+                                        ReadingTheme.NIGHT -> androidx.compose.ui.graphics.Color(0xFF20231F)
+                                    },
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        if (readingTheme == theme) 2.dp else 1.dp,
+                                        if (readingTheme == theme) MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.outline,
+                                    ),
+                                    modifier = Modifier.size(42.dp),
+                                ) {}
+                                Text(when (theme) {
+                                    ReadingTheme.DAY -> "明亮"
+                                    ReadingTheme.SEPIA -> "护眼"
+                                    ReadingTheme.NIGHT -> "夜间"
+                                }, style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
                     }
                 }
             },
@@ -466,96 +476,6 @@ private fun BottomBarButton(
 
 private fun Modifier.clickableIfEnabled(enabled: Boolean, onClick: () -> Unit): Modifier =
     if (enabled) this.clickable(onClick = onClick) else this
-
-@Composable
-private fun ReaderFab(
-    expanded: Boolean,
-    onToggle: () -> Unit,
-    hasPrev: Boolean,
-    hasNext: Boolean,
-    readingTheme: ReadingTheme,
-    onPrev: () -> Unit,
-    onNext: () -> Unit,
-    onShowToc: () -> Unit,
-    onFont: () -> Unit,
-    onTheme: () -> Unit,
-    onAsk: () -> Unit,
-) {
-    Column(
-        horizontalAlignment = androidx.compose.ui.Alignment.End,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        AnimatedVisibility(
-            visible = expanded,
-            enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
-            exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
-        ) {
-            Column(
-                horizontalAlignment = androidx.compose.ui.Alignment.End,
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                MiniFabRow("上一章", Icons.Default.NavigateBefore, enabled = hasPrev, onClick = onPrev)
-                MiniFabRow("下一章", Icons.Default.NavigateNext, enabled = hasNext, onClick = onNext)
-                MiniFabRow("目录", Icons.AutoMirrored.Filled.List, onClick = onShowToc)
-                MiniFabRow("字号", Icons.Default.FormatSize, onClick = onFont)
-                MiniFabRow(
-                    when (readingTheme) {
-                        ReadingTheme.DAY -> "白天"
-                        ReadingTheme.SEPIA -> "护眼"
-                        ReadingTheme.NIGHT -> "夜间"
-                    },
-                    Icons.Default.Brightness4,
-                    onClick = onTheme,
-                )
-                MiniFabRow("问AI", Icons.AutoMirrored.Filled.Chat, onClick = onAsk)
-            }
-        }
-        androidx.compose.material3.FloatingActionButton(
-            onClick = onToggle,
-            containerColor = MaterialTheme.colorScheme.primaryContainer,
-            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-        ) {
-            Icon(
-                if (expanded) Icons.Default.Close else Icons.Default.Menu,
-                contentDescription = if (expanded) "收起菜单" else "展开菜单",
-            )
-        }
-    }
-}
-
-@Composable
-private fun MiniFabRow(
-    label: String,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    enabled: Boolean = true,
-    onClick: () -> Unit,
-) {
-    Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-        androidx.compose.material3.Surface(
-            shape = MaterialTheme.shapes.small,
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 2.dp,
-            modifier = Modifier.padding(end = 8.dp),
-        ) {
-            Text(
-                label,
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                style = MaterialTheme.typography.labelMedium,
-                color = if (enabled) MaterialTheme.colorScheme.onSurface
-                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f),
-            )
-        }
-        androidx.compose.material3.SmallFloatingActionButton(
-            onClick = { if (enabled) onClick() },
-            containerColor = if (enabled) MaterialTheme.colorScheme.secondaryContainer
-            else MaterialTheme.colorScheme.surfaceVariant,
-            contentColor = if (enabled) MaterialTheme.colorScheme.onSecondaryContainer
-            else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f),
-        ) {
-            Icon(icon, contentDescription = label)
-        }
-    }
-}
 
 @Composable
 private fun ChapterPage(
