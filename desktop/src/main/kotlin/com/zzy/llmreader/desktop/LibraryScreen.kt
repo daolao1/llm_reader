@@ -32,6 +32,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import com.zzy.llmreader.ui.icons.ReaderIcons
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,7 +79,7 @@ fun LibraryScreen(
                 ) {
                     Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(ReaderIcons.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("添加书籍", color = MaterialTheme.colorScheme.onPrimary)
                     }
@@ -94,7 +95,7 @@ fun LibraryScreen(
                     style = MaterialTheme.typography.titleLarge)
                 Spacer(Modifier.weight(1f))
                 TextButton(onClick = onAddUrl) {
-                    Icon(Icons.Default.Explore, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Icon(ReaderIcons.Link, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("从网页添加")
                 }
@@ -146,7 +147,7 @@ private fun HeroReading(book: RecentBook, onOpen: () -> Unit) {
                 Row(Modifier.padding(horizontal = 16.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("继续阅读", color = MaterialTheme.colorScheme.onPrimary)
                     Spacer(Modifier.width(8.dp))
-                    Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null,
+                    Icon(ReaderIcons.ArrowRight, contentDescription = null,
                         tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(18.dp))
                 }
             }
@@ -172,7 +173,7 @@ private fun ShelfBook(book: RecentBook, onOpen: () -> Unit, onRemove: () -> Unit
             )
             Spacer(Modifier.weight(1f))
             Icon(
-                Icons.Default.DeleteOutline,
+                ReaderIcons.Trash,
                 contentDescription = "移除《${book.title}》",
                 modifier = Modifier.size(18.dp).clickable(onClick = onRemove),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -205,7 +206,7 @@ internal fun BookCover(title: String, width: androidx.compose.ui.unit.Dp, height
 private fun EmptyShelf(onOpenFile: () -> Unit, onAddUrl: () -> Unit) {
     Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
         Row(Modifier.padding(28.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.AutoMirrored.Filled.LibraryBooks, contentDescription = null,
+            Icon(ReaderIcons.Library, contentDescription = null,
                 modifier = Modifier.size(44.dp), tint = MaterialTheme.colorScheme.secondary)
             Spacer(Modifier.width(22.dp))
             Column(Modifier.weight(1f)) {

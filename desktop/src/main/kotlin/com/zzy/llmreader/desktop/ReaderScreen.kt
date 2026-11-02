@@ -57,6 +57,7 @@ import com.zzy.llmreader.format.htmlToRichBlocks
 import com.zzy.llmreader.format.stripInlineImageMarkers
 import com.zzy.llmreader.model.BookContent
 import com.zzy.llmreader.model.Chapter
+import com.zzy.llmreader.ui.icons.ReaderIcons
 import kotlinx.coroutines.flow.collectLatest
 
 @Composable
@@ -253,7 +254,7 @@ private fun ReaderFloatingTools(
         Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surface.copy(alpha = .92f),
             shadowElevation = 4.dp) {
             IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回书架")
+                Icon(ReaderIcons.ArrowLeft, contentDescription = "返回书架")
             }
         }
         Surface(
@@ -262,7 +263,7 @@ private fun ReaderFloatingTools(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = onShowToc) {
-                    Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = "打开目录")
+                    Icon(ReaderIcons.BookOpen, contentDescription = "打开目录")
                 }
                 Text(
                     state.current?.translatedTitle ?: state.current?.title.orEmpty(),
@@ -271,7 +272,7 @@ private fun ReaderFloatingTools(
                     modifier = Modifier.widthIn(max = 250.dp),
                 )
                 IconButton(onClick = onShowSettings) {
-                    Icon(Icons.Default.Tune, contentDescription = "阅读设置")
+                    Icon(ReaderIcons.Tune, contentDescription = "阅读设置")
                 }
             }
         }

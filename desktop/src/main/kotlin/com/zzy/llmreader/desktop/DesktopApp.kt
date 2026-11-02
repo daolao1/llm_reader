@@ -57,6 +57,7 @@ import com.zzy.llmreader.LlmReaderCore
 import com.zzy.llmreader.data.AppTheme
 import com.zzy.llmreader.data.ReadingTheme
 import com.zzy.llmreader.data.TranslationMode
+import com.zzy.llmreader.ui.icons.ReaderIcons
 import java.awt.FileDialog
 import java.awt.Frame
 import java.awt.SystemColor
@@ -134,9 +135,9 @@ private fun LibraryTopActions(onTheme: () -> Unit, onSettings: () -> Unit, dark:
     Row(Modifier.fillMaxWidth().padding(horizontal = 26.dp, vertical = 20.dp),
         horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
         IconButton(onClick = onTheme) {
-            Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, contentDescription = "切换主题")
+            Icon(ReaderIcons.SunMoon, contentDescription = "切换主题")
         }
-        IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, contentDescription = "设置") }
+        IconButton(onClick = onSettings) { Icon(ReaderIcons.Settings, contentDescription = "设置") }
         Spacer(Modifier.width(156.dp))
     }
 }
@@ -159,7 +160,7 @@ private fun ChapterDrawer(state: DesktopUiState, app: DesktopAppState, onDismiss
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
-                    IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, contentDescription = "关闭目录") }
+                    IconButton(onClick = onDismiss) { Icon(ReaderIcons.X, contentDescription = "关闭目录") }
                 }
                 Spacer(Modifier.height(20.dp))
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -187,7 +188,7 @@ private fun ChapterDrawer(state: DesktopUiState, app: DesktopAppState, onDismiss
                                     style = if (selected) MaterialTheme.typography.titleSmall else MaterialTheme.typography.bodySmall,
                                     modifier = Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 if (chapter.translatedContent != null) {
-                                    Icon(Icons.Default.Translate, contentDescription = "已有译文",
+                                    Icon(ReaderIcons.Languages, contentDescription = "已有译文",
                                         modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.secondary)
                                 }
                             }
@@ -211,10 +212,10 @@ private fun ReadingPanel(state: DesktopUiState, app: DesktopAppState, onDismiss:
         ) {
             Column(Modifier.padding(24.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Tune, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+                    Icon(ReaderIcons.Tune, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
                     Spacer(Modifier.width(10.dp))
                     Text("阅读偏好", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                    IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, contentDescription = "关闭") }
+                    IconButton(onClick = onDismiss) { Icon(ReaderIcons.X, contentDescription = "关闭") }
                 }
                 Spacer(Modifier.height(22.dp))
                 Text("显示方式", style = MaterialTheme.typography.labelLarge,
@@ -240,7 +241,7 @@ private fun ReadingPanel(state: DesktopUiState, app: DesktopAppState, onDismiss:
                 }
                 Spacer(Modifier.height(22.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.FormatSize, contentDescription = null)
+                    Icon(ReaderIcons.FileText, contentDescription = null)
                     Spacer(Modifier.width(10.dp))
                     Text("正文字号", modifier = Modifier.weight(1f))
                     TextButton(onClick = { app.setFontScale(state.fontScale - .1f) }) { Text("A−") }
@@ -282,7 +283,7 @@ private fun ReadingPanel(state: DesktopUiState, app: DesktopAppState, onDismiss:
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
                 ) {
-                    Icon(Icons.Default.Translate, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Icon(ReaderIcons.Languages, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(if (state.currentChapter in state.translatingChapters) "正在翻译…" else "翻译本章")
                 }

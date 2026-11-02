@@ -20,6 +20,8 @@ kotlin {
             dependencies {
                 implementation(libs.kotlinx.coroutines.core)
                 implementation(libs.kotlinx.serialization.json)
+                // 仅矢量绘制 API：双端共用少量精选 Lucide 图标，不含 Compose UI 组件树。
+                implementation(libs.compose.ui.multiplatform)
             }
         }
 

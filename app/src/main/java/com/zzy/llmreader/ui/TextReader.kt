@@ -80,6 +80,7 @@ import com.zzy.llmreader.ui.theme.toTypeface
 import com.zzy.llmreader.data.ReadingTheme
 import com.zzy.llmreader.data.TranslationMode
 import com.zzy.llmreader.model.BookContent
+import com.zzy.llmreader.ui.icons.ReaderIcons
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -279,7 +280,7 @@ fun TextReader(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                        Icon(Icons.Default.FormatSize, contentDescription = null)
+                        Icon(ReaderIcons.FileText, contentDescription = null)
                         Spacer(Modifier.width(10.dp))
                         Text("正文字号", modifier = Modifier.weight(1f))
                         TextButton(onClick = { onSetFontScale(fontScale - 0.1f) }) { Text("A−") }
@@ -380,17 +381,17 @@ private fun ReaderBottomBar(
                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
             ) {
                 BottomBarButton(
-                    icon = Icons.AutoMirrored.Filled.List,
+                    icon = ReaderIcons.BookOpen,
                     label = "目录",
                     onClick = onShowToc,
                 )
                 BottomBarButton(
-                    icon = Icons.Default.Tune,
+                    icon = ReaderIcons.Tune,
                     label = "阅读设置",
                     onClick = { showFontMenu = true },
                 )
                 BottomBarButton(
-                    icon = Icons.AutoMirrored.Filled.Chat,
+                    icon = ReaderIcons.MessageQuestion,
                     label = "问 AI",
                     onClick = onAsk,
                 )
@@ -409,7 +410,7 @@ private fun ReaderBottomBar(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                        Icon(Icons.Default.FormatSize, contentDescription = null)
+                        Icon(ReaderIcons.FileText, contentDescription = null)
                         Spacer(Modifier.width(10.dp))
                         Text("正文字号", modifier = Modifier.weight(1f))
                         TextButton(onClick = { onSetFontScale(fontScale - 0.1f) }) { Text("A−") }

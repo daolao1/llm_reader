@@ -103,6 +103,7 @@ import com.zzy.llmreader.data.RecentBookSource
 import com.zzy.llmreader.data.TranslationMode
 import com.zzy.llmreader.format.FormatDetector
 import com.zzy.llmreader.model.BookContent
+import com.zzy.llmreader.ui.icons.ReaderIcons
 import com.zzy.llmreader.ui.theme.ReaderThemeOverride
 import com.zzy.llmreader.web.WebSource
 import java.text.SimpleDateFormat
@@ -257,17 +258,17 @@ fun ReaderApp(
                             returnToDiscovery = false
                             viewModel.closeBook()
                         }) {
-                            Icon(Icons.Default.AutoStories, contentDescription = "返回书架")
+                            Icon(ReaderIcons.Library, contentDescription = "返回书架")
                         }
                     }
                 },
                 actions = {
                     if (state.book == null) {
                         IconButton(onClick = { showDiscovery = true }) {
-                            Icon(Icons.Default.Search, contentDescription = "浏览网站")
+                            Icon(ReaderIcons.Search, contentDescription = "浏览网站")
                         }
                         IconButton(onClick = { showUrlDialog = true }) {
-                            Icon(Icons.Default.Link, contentDescription = "添加网页小说")
+                            Icon(ReaderIcons.Link, contentDescription = "添加网页小说")
                         }
                     } else {
                         TranslationModeMenu(
@@ -277,7 +278,7 @@ fun ReaderApp(
                         )
                         Box {
                             IconButton(onClick = { showOverflow = true }) {
-                                Icon(Icons.Default.MoreVert, contentDescription = "更多操作")
+                                Icon(ReaderIcons.More, contentDescription = "更多操作")
                             }
                             DropdownMenu(
                                 expanded = showOverflow,
@@ -285,7 +286,7 @@ fun ReaderApp(
                             ) {
                                 DropdownMenuItem(
                                     text = { Text("查看详情") },
-                                    leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                                    leadingIcon = { Icon(ReaderIcons.Info, contentDescription = null) },
                                     onClick = {
                                         showOverflow = false
                                         viewModel.openBookDetailForCurrent()
@@ -293,7 +294,7 @@ fun ReaderApp(
                                 )
                                 DropdownMenuItem(
                                     text = { Text("图片生成") },
-                                    leadingIcon = { Icon(Icons.Default.Image, contentDescription = null) },
+                                    leadingIcon = { Icon(ReaderIcons.Image, contentDescription = null) },
                                     onClick = {
                                         showOverflow = false
                                         showImagePanel = true
@@ -301,7 +302,7 @@ fun ReaderApp(
                                 )
                                 DropdownMenuItem(
                                     text = { Text("术语表") },
-                                    leadingIcon = { Icon(Icons.Default.MenuBook, contentDescription = null) },
+                                    leadingIcon = { Icon(ReaderIcons.BookOpen, contentDescription = null) },
                                     onClick = {
                                         showOverflow = false
                                         showGlossary = true
@@ -324,7 +325,7 @@ fun ReaderApp(
                                 )
                                 DropdownMenuItem(
                                     text = { Text("重新翻译本章") },
-                                    leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
+                                    leadingIcon = { Icon(ReaderIcons.Refresh, contentDescription = null) },
                                     enabled = !state.loading
                                         && state.currentChapter !in state.translatingChapters
                                         && !isOriginalMode,
@@ -336,7 +337,7 @@ fun ReaderApp(
                                 if (isWebBook) {
                                     DropdownMenuItem(
                                         text = { Text("重新下载本章") },
-                                        leadingIcon = { Icon(Icons.Default.CloudDownload, contentDescription = null) },
+                                        leadingIcon = { Icon(ReaderIcons.Download, contentDescription = null) },
                                         enabled = !state.loading
                                             && state.currentChapter !in state.loadingChapters,
                                         onClick = {
@@ -351,7 +352,7 @@ fun ReaderApp(
                                                 else "刷新目录（保留译文）",
                                             )
                                         },
-                                        leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
+                                        leadingIcon = { Icon(ReaderIcons.Refresh, contentDescription = null) },
                                         enabled = !state.loading && !state.tocRefreshing,
                                         onClick = {
                                             showOverflow = false
@@ -363,7 +364,7 @@ fun ReaderApp(
                         }
                     }
                     IconButton(onClick = { showSettings = true }) {
-                        Icon(Icons.Default.Settings, contentDescription = "设置")
+                        Icon(ReaderIcons.Settings, contentDescription = "设置")
                     }
                 },
             )
@@ -373,7 +374,7 @@ fun ReaderApp(
             if (state.book == null) {
                 ExtendedFloatingActionButton(
                     onClick = { openLauncher.launch(FormatDetector.openableMimeTypes) },
-                    icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
+                    icon = { Icon(ReaderIcons.FolderOpen, contentDescription = null) },
                     text = { Text("打开文件") },
                 )
             }
@@ -620,7 +621,7 @@ private fun TranslationModeMenu(
             enabled = enabled,
         ) {
             Icon(
-                imageVector = Icons.Default.Translate,
+                imageVector = ReaderIcons.Languages,
                 contentDescription = null,
                 modifier = Modifier.size(18.dp),
             )
@@ -761,7 +762,7 @@ private fun LibraryScreen(
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 17.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Default.AutoStories, contentDescription = null,
+                    Icon(ReaderIcons.Library, contentDescription = null,
                         tint = MaterialTheme.colorScheme.onPrimaryContainer)
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
@@ -781,7 +782,7 @@ private fun LibraryScreen(
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(
-                        Icons.Default.AutoStories,
+                        ReaderIcons.Library,
                         contentDescription = null,
                         modifier = Modifier.size(56.dp),
                         tint = MaterialTheme.colorScheme.primary,
@@ -802,12 +803,12 @@ private fun LibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         TextButton(onClick = onAddWebBook) {
-                            Icon(Icons.Default.Link, contentDescription = null)
+                            Icon(ReaderIcons.Link, contentDescription = null)
                             Spacer(Modifier.size(6.dp))
                             Text("粘贴链接")
                         }
                         TextButton(onClick = onPick) {
-                            Icon(Icons.Default.FolderOpen, contentDescription = null)
+                            Icon(ReaderIcons.FolderOpen, contentDescription = null)
                             Spacer(Modifier.size(6.dp))
                             Text("选择文件")
                         }
@@ -979,7 +980,7 @@ private fun RecentItem(
                 }
             }
             IconButton(onClick = onShowDetail) {
-                Icon(Icons.Default.Info, contentDescription = "查看详情")
+                Icon(ReaderIcons.Info, contentDescription = "查看详情")
             }
             IconButton(onClick = onDelete) {
                 Icon(Icons.Default.Delete, contentDescription = "移除")
